@@ -1,17 +1,19 @@
-# fly.toml — конфиг для Fly.io
-
 app = "gotovo-bot"
 primary_region = "waw"
-
-[env]
-  PORT = "8080"
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"
+  auto_stop_machines = "off"        # ← Исправлено: не останавливаем
   auto_start_machines = true
   min_machines_running = 0
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "10s"
+    grace_period = "5s"
+    method = "GET"
+    path = "/"
 
 [[vm]]
   cpu_kind = "shared"
