@@ -5,7 +5,7 @@ from collections import defaultdict
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-import openai  # <-- так надёжнее для разных версий пакета
+from openai import AsyncOpenAI
 
 # ===== ЛОГИ =====
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -22,7 +22,7 @@ if not OPENAI_API_KEY:
     raise SystemExit("Нет OPENAI_API_KEY (задай: flyctl secrets set OPENAI_API_KEY=...)")
 
 # ===== OpenAI =====
-client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 # ===== Health-check HTTP для Fly =====
 class _Health(BaseHTTPRequestHandler):
@@ -32,9 +32,10 @@ class _Health(BaseHTTPRequestHandler):
 def _run_health():
     HTTPServer(("0.0.0.0", PORT), _Health).serve_forever()
 
-# ===== Память настроек (RAM) =====
+# ===== Память настроек в RAM (на рестарт не сохраняется — это нормально для MVP) =====
 USER_MODE = defaultdict(lambda: "Готово")  # "Обучение" | "Подсказка" | "Готово"
 
+# ===== Вспомогалка: промпт по режиму =====
 def mode_hint(mode: str) -> str:
     return {
         "Обучение": "Задавай 2–3 наводящих вопроса, но всё же приведи верное решение.",
@@ -49,7 +50,6 @@ async def set_commands(app: Application):
         BotCommand("help", "Как пользоваться"),
         BotCommand("mode", "Режим: Обучение/Подсказка/Готово"),
         BotCommand("solve", "Решить текстовое задание: /solve ТЕКСТ"),
-        BotCommand("diag", "Проверка OpenAI"),
     ])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -82,22 +82,6 @@ async def mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     USER_MODE[uid] = val
     await update.message.reply_text(f"Режим установлен: {val}")
 
-# ===== Диагностика =====
-async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Ответь одним словом: ok"},
-                {"role": "user", "content": "ping"}
-            ],
-            temperature=0
-        )
-        await update.message.reply_text(f"OpenAI OK: {resp.choices[0].message.content.strip()}")
-    except Exception as e:
-        log.exception("diag")
-        await update.message.reply_text(f"OpenAI ERROR: {type(e).__name__}: {e}")
-
 # ===== Решение ТЕКСТОМ =====
 async def solve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -114,12 +98,12 @@ async def solve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resp = await client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.2,
-            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}]
+            messages=[{"role":"system","content":sys},{"role":"user","content":user}]
         )
         out = resp.choices[0].message.content.strip()
         await update.message.reply_text(out[:4000])
     except Exception as e:
-        log.exception("solve_cmd")
+        logging.exception("solve_cmd")
         await update.message.reply_text(f"Не получилось решить: {e}")
 
 # ===== Решение С ФОТО =====
@@ -134,15 +118,15 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         b64 = base64.b64encode(bio.getvalue()).decode("ascii")
 
         messages = [
-            {"role": "system", "content":
+            {"role":"system","content":
              "Ты помощник для школьников (ФГОС, 5–11 класс). Объясняй просто и по шагам, "
              "без перегруза терминами, добавляй аналогии."},
-            {"role": "user", "content": [
-                {"type": "text", "text": f"Режим: {mode}. {mode_hint(mode)}\n"
-                                         "1) Распознай текст задания (исправь OCR-ошибки по смыслу).\n"
-                                         "2) Реши и объясни по шагам.\n"
-                                         "3) В конце — краткое резюме (2–3 предложения) и 1–2 проверочных вопроса."},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+            {"role":"user","content":[
+                {"type":"text","text":f"Режим: {mode}. {mode_hint(mode)}\n"
+                                      "1) Распознай текст задания (исправь OCR-ошибки по смыслу).\n"
+                                      "2) Реши и объясни по шагам.\n"
+                                      "3) В конце — краткое резюме (2–3 предложения) и 1–2 проверочных вопроса."},
+                {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}
             ]}
         ]
 
@@ -154,7 +138,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         out = resp.choices[0].message.content.strip()
         await update.message.reply_text(out[:4000])
     except Exception as e:
-        log.exception("photo_handler")
+        logging.exception("photo_handler")
         await update.message.reply_text(f"Не смог обработать фото: {e}")
 
 # ===== main =====
@@ -168,12 +152,10 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("mode", mode_cmd))
     app.add_handler(CommandHandler("solve", solve_cmd))
-    app.add_handler(CommandHandler("diag", diag_cmd))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
 
     log.info("Umnik MVP is running…")
-    # БЕЗ allowed_updates — это может валить запуск на v21
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
