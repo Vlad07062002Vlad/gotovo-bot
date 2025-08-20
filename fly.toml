@@ -9,6 +9,9 @@ primary_region = "waw"
   PORT = "8080"
   DB_PATH = "data/umnik.db"
 
+[processes]
+  web = "python bot.py"   # <— вот это добавили
+
 [http_service]
   internal_port = 8080
   force_https = true
