@@ -128,6 +128,7 @@ async def parent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- GPT-хелперы ----------
 async def gpt_explain(uid:int, prompt:str) -> str:
+    log.info(f"EXPLAIN uid={uid} subj={USER_SUBJECT[uid]} grade={USER_GRADE[uid]} parent={PARENT_MODE[uid]} text={prompt[:60]}")
     resp = await client.chat.completions.create(
         model="gpt-4o",
         messages=[
@@ -139,6 +140,7 @@ async def gpt_explain(uid:int, prompt:str) -> str:
     return resp.choices[0].message.content.strip()
 
 async def gpt_essay(uid:int, topic:str) -> str:
+    log.info(f"ESSAY uid={uid} topic={topic[:60]}")
     resp = await client.chat.completions.create(
         model="gpt-4o",
         messages=[
@@ -205,6 +207,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = (update.message.text or "").strip()
+    log.info(f"TEXT uid={uid} state={USER_STATE[uid]} text={text!r}")
 
     # Кнопки
     if text == "🧠 Объяснить":           return await explain_cmd(update, context)
