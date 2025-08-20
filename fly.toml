@@ -6,10 +6,10 @@ primary_region = "waw"
   buildpacks = ["gcr.io/paketo-buildpacks/python"]
 
 [env]
-  PORT = "8080"
+  PORT = "8080"  # bot.py должен слушать этот порт (healthcheck)
 
 [processes]
-  web = "python bot.py"
+  web = "python bot.py"  # явный процесс, на который ссылается http_service
 
 [http_service]
   internal_port = 8080
