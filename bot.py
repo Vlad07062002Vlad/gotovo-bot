@@ -5,7 +5,6 @@ from collections import defaultdict
 from telegram import Update, BotCommand, ReplyKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-
 import openai
 
 # ---------- ЛОГИ ----------
@@ -27,16 +26,13 @@ client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
 class _Health(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
-
 def _run_health():
     HTTPServer(("0.0.0.0", PORT), _Health).serve_forever()
 
-# ---------- ПАМЯТЬ (в RAM) ----------
-SUBJECTS = {
-    "математика","русский","английский","физика","химия",
-    "история","обществознание","биология","информатика",
-    "география","литература","auto"
-}
+# ---------- ПАМЯТЬ (RAM) ----------
+SUBJECTS = {"математика","русский","английский","физика","химия",
+            "история","обществознание","биология","информатика",
+            "география","литература","auto"}
 USER_SUBJECT = defaultdict(lambda: "auto")
 USER_GRADE   = defaultdict(lambda: "8")
 PARENT_MODE  = defaultdict(lambda: False)
@@ -53,31 +49,27 @@ def kb(uid:int) -> ReplyKeyboardMarkup:
     )
 
 def sys_prompt(uid:int) -> str:
-    subject = USER_SUBJECT[uid]
-    grade   = USER_GRADE[uid]
-    parent  = PARENT_MODE[uid]
-    base = (
-        "Ты — ИИ-репетитор по ФГОС. Объясняй как старший брат: просто, по шагам, с короткими аналогиями. "
-        "Всегда делай структуру: 1) Условие (в 1–2 строках) → 2) Решение по шагам → 3) Кратко (2–3 предложения). "
-        "Добавляй 1–2 проверочных вопроса."
-    )
+    subject = USER_SUBJECT[uid]; grade = USER_GRADE[uid]; parent = PARENT_MODE[uid]
+    base = ("Ты — ИИ-репетитор по ФГОС. Объясняй как старший брат: просто, по шагам, с короткими аналогиями. "
+            "Структура: 1) Условие (1–2 строки) → 2) Решение по шагам → 3) Кратко (2–3 предложения). "
+            "Добавляй 1–2 проверочных вопроса.")
     sub = f"Предмет: {subject}." if subject != "auto" else "Определи предмет сам по содержанию."
     grd = f"Класс: {grade}."
-    par = "В конце добавь краткую памятку для родителей (на что обратить внимание)." if parent else ""
+    par = "В конце добавь краткую памятку для родителей." if parent else ""
     return f"{base} {sub} {grd} {par}"
 
 # ---------- КОМАНДЫ ----------
 async def set_commands(app: Application):
     await app.bot.set_my_commands([
-        BotCommand("start",   "Запуск"),
-        BotCommand("menu",    "Показать меню"),
-        BotCommand("help",    "Как пользоваться"),
-        BotCommand("subject", "Задать предмет (или auto)"),
-        BotCommand("grade",   "Задать класс 5–11"),
-        BotCommand("parent",  "Режим для родителей on/off"),
-        BotCommand("essay",   "Сочинение: /essay ТЕМА"),
-        BotCommand("explain", "Объяснить: /explain ТЕКСТ"),
-        BotCommand("diag",    "Проверка OpenAI"),
+        BotCommand("start","Запуск"),
+        BotCommand("menu","Показать меню"),
+        BotCommand("help","Как пользоваться"),
+        BotCommand("subject","Задать предмет (или auto)"),
+        BotCommand("grade","Задать класс 5–11"),
+        BotCommand("parent","Режим для родителей on/off"),
+        BotCommand("essay","Сочинение: /essay ТЕМА"),
+        BotCommand("explain","Объяснить: /explain ТЕКСТ"),
+        BotCommand("diag","Проверка OpenAI"),
     ])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -95,8 +87,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     await update.message.reply_text(
         "Как пользоваться:\n"
-        "• Просто напиши, что непонятно — объясню.\n"
-        "• Пришли фото задания — распознаю и решу по шагам.\n"
+        "• Напиши, что непонятно — объясню по-простому.\n"
+        "• Пришли фото — распознаю и решу по шагам.\n"
         "• /essay ТЕМА — сочинение 150–200 слов.\n"
         "• /subject ПРЕДМЕТ|auto  • /grade 5–11  • /parent on|off",
         reply_markup=kb(uid)
@@ -105,7 +97,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def subject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not context.args:
-        return await update.message.reply_text("Доступные предметы: " + ", ".join(sorted(SUBJECTS)))
+        return await update.message.reply_text("Доступно: " + ", ".join(sorted(SUBJECTS)))
     val = " ".join(context.args).strip().lower()
     if val not in SUBJECTS:
         return await update.message.reply_text("Не понял предмет. Доступно: " + ", ".join(sorted(SUBJECTS)))
@@ -159,7 +151,7 @@ async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USER_STATE[uid] = "AWAIT_EXPLAIN"
         return await update.message.reply_text("🧠 Что объяснить? Напиши одной фразой.", reply_markup=kb(uid))
     try:
-        await update.message.chat.send_action(action=ChatAction.TYPING)
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         out = await gpt_explain(uid, text)
         await update.message.reply_text(out[:4000], reply_markup=kb(uid))
     except Exception as e:
@@ -173,7 +165,7 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USER_STATE[uid] = "AWAIT_ESSAY"
         return await update.message.reply_text("📝 Тема сочинения?", reply_markup=kb(uid))
     try:
-        await update.message.chat.send_action(action=ChatAction.TYPING)
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         out = await gpt_essay(uid, topic)
         await update.message.reply_text(out[:4000], reply_markup=kb(uid))
     except Exception as e:
@@ -183,9 +175,11 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     try:
-        await update.message.chat.send_action(action=ChatAction.TYPING)
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         file = await update.message.photo[-1].get_file()
         data = await file.download_as_bytearray()
+        # (опционально) ограничить размер:
+        # if len(data) > 5*1024*1024: return await update.message.reply_text("Фото слишком большое.", reply_markup=kb(uid))
         b64 = base64.b64encode(data).decode("utf-8")
 
         msgs = [
@@ -224,13 +218,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USER_STATE[uid] = None
         context.args = [text]
         return await explain_cmd(update, context)
-
     if state == "AWAIT_ESSAY":
         USER_STATE[uid] = None
         context.args = [text]
         return await essay_cmd(update, context)
 
-    # Молчаливое поведение: любой текст — это запрос «объяснить»
+    # Любой текст = объяснить
     context.args = [text]
     return await explain_cmd(update, context)
 
@@ -266,7 +259,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     log.info("Gotovo bot is running…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(drop_pending_updates=True)  # попроще, без allowed_updates
 
 if __name__ == "__main__":
     main()
