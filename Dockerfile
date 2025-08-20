@@ -16,3 +16,6 @@ COPY . .
 
 # Стартуем бота
 CMD ["python", "bot.py"]
+
+
+
