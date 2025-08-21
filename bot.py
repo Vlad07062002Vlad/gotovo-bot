@@ -188,8 +188,8 @@ async def gpt_essay(uid: int, topic: str) -> str:
     resp = await client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": sys_prompt(uid)},
-            {"role": "user", "content": f"Напиши сочинение на 150–200 слов. Тема: {topic}. Пиши как ученик {USER_GRADE[uid]} класса."}
+            {"role": "system", "content": f"Ты — ученик {USER_GRADE[uid]} класса. Пиши сочинение как ученик: просто, по делу, 150–200 слов. Без вступлений в диалог."},
+            {"role": "user", "content": f"Напиши сочинение. Тема: {topic}"}
         ],
         temperature=0.7,
         max_tokens=700
@@ -219,14 +219,29 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     topic = " ".join(context.args).strip()
     if not topic:
         USER_STATE[uid] = "AWAIT_ESSAY"
-        return await update.message.reply_text("📝 Тема сочинения?", reply_markup=kb(uid))
+        return await update.message.reply_text("📝 Напиши тему сочинения.", reply_markup=kb(uid))
+    
     try:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-        out = await gpt_essay(uid, topic)
-        await update.message.reply_text(out[:4000], reply_markup=kb(uid))
+        
+        # Шаг 1: Написать сочинение
+        essay = await gpt_essay(uid, topic)
+        await update.message.reply_text(essay[:4000], parse_mode="MarkdownV2", disable_web_page_preview=True)
+
+        # Шаг 2: Объяснить, как писать такие сочинения
+        explain_prompt = (
+            f"Объясни, как написать сочинение на тему: '{topic}'. "
+            "Структура: 1) Условие → 2) Решение по шагам (как построить текст) → 3) Кратко. "
+            "Добавь 1–2 вопроса для закрепления."
+        )
+        explanation = await gpt_explain(uid, explain_prompt)
+        await update.message.reply_text(explanation[:4000], parse_mode="MarkdownV2", disable_web_page_preview=True)
+
+        # Шаг 3: Предложить уточнить
         keyboard = ReplyKeyboardMarkup([["Да", "Нет"]], resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("Хочешь уточнить по сочинению?", reply_markup=keyboard)
         USER_STATE[uid] = "AWAIT_FOLLOWUP"
+
     except Exception as e:
         log.exception("essay")
         await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=kb(uid))
@@ -239,45 +254,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = await file.download_as_bytearray()
         b64 = base64.b64encode(data).decode("utf-8")
 
-        # Анализ: сколько заданий?
-        analysis_prompt = (
-            "Проанализируй фото. Сколько отдельных заданий ты видишь? "
-            "Перечисли кратко: 1) ..., 2) ..., 3) ... "
-            "Если неясно — скажи: 'Не удаётся разобрать задания'."
-        )
-        analysis_resp = await client.chat.completions.create(
+        # Просто распознаём и решаем — как раньше
+        msgs = [
+            {"role": "system", "content": sys_prompt(uid)},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Распознай задание с фото, реши и объясни по шагам."},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+            ]}
+        ]
+        resp = await client.chat.completions.create(
             model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "Ты анализируешь школьные задания."},
-                {"role": "user", "content": [
-                    {"type": "text", "text": analysis_prompt},
-                    {"type": "image_url", "image_url": {"url": f"image/jpeg;base64,{b64}"}}
-                ]}
-            ],
-            max_tokens=500
+            messages=msgs,
+            temperature=0.2,
+            max_tokens=1200
         )
-        analysis = analysis_resp.choices[0].message.content.strip()
-
-        if "не удаётся разобрать" not in analysis.lower() and "неясно" not in analysis.lower():
-            await update.message.reply_text(
-                f"Я вижу несколько заданий:\n\n{analysis}\n\n"
-                "Какое хочешь решить? Напиши номер или условие."
-            )
-            USER_STATE[uid] = "AWAIT_EXPLAIN"
-            return
-
-        # Если не получилось — предложить альтернативу
-        keyboard = ReplyKeyboardMarkup(
-            [["📸 Решить по фото", "✍️ Напишу текстом"]],
-            resize_keyboard=True,
-            one_time_keyboard=True
-        )
-        await update.message.reply_text(
-            "К сожалению, не удалось разобрать задание по фото.\n\n"
-            "Выбери, как удобнее:",
-            reply_markup=keyboard
-        )
-        USER_STATE[uid] = "AWAIT_TEXT_OR_PHOTO_CHOICE"
+        out = resp.choices[0].message.content.strip()
+        await update.message.reply_text(out[:4000], parse_mode="MarkdownV2", disable_web_page_preview=True)
 
     except Exception as e:
         log.exception("photo")
