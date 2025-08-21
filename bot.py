@@ -246,26 +246,6 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("essay")
         await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=kb(uid))
 
-import base64
-import logging
-from io import BytesIO
-
-from telegram import Update, BotCommand, ReplyKeyboardMarkup
-from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from openai import AsyncOpenAI
-import os
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from collections import defaultdict
-
-# ... (остальные импорты остаются прежними)
-
-# ---------- ЛОГИ ----------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("gotovo-bot")
-
-# ... (остальная часть кода до handle_photo)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
