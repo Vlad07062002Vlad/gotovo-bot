@@ -11,6 +11,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 from openai import AsyncOpenAI
 from PIL import Image
 import pytesseract
+
 # ---------- ЛОГИ ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("gotovo-bot")
@@ -175,13 +176,14 @@ async def parent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Режим для родителей: {status}", reply_markup=kb(uid))
 
 # ---------- GPT-хелперы ----------
-async def gpt_explain(uid: int, prompt: str) -> str:
+async def gpt_explain(uid: int, prompt: str, prepend_prompt: bool = True) -> str:
     log.info(f"EXPLAIN uid={uid} subj={USER_SUBJECT[uid]} grade={USER_GRADE[uid]} text={prompt[:60]}")
+    user_content = f"Объясни простыми словами: {prompt}" if prepend_prompt else prompt
     resp = await client.chat.completions.create(
         model="gpt-4o",
         messages=[
             {"role": "system", "content": sys_prompt(uid)},
-            {"role": "user", "content": f"Объясни простыми словами: {prompt}"}
+            {"role": "user", "content": user_content}
         ],
         temperature=0.3,
         max_tokens=900
@@ -231,7 +233,12 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Шаг 1: Написать сочинение
         essay = await gpt_essay(uid, topic)
-        await update.message.reply_text(essay[:4000], parse_mode="HTML", disable_web_page_preview=True)
+        await update.message.reply_text(
+            essay[:4000],
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=kb(uid)
+        )
 
         # Шаг 2: Объяснить, как писать такие сочинения
         explain_prompt = (
@@ -240,8 +247,13 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Добавь 1–2 вопроса для закрепления. "
             "Ответ должен использовать только HTML-теги для форматирования: <b>жирный</b>, <i>курсив</i>, <code>моноширинный</code>. Не используй Markdown (**, *, `)."
         )
-        explanation = await gpt_explain(uid, explain_prompt)
-        await update.message.reply_text(explanation[:4000], parse_mode="HTML", disable_web_page_preview=True)
+        explanation = await gpt_explain(uid, explain_prompt, prepend_prompt=False)
+        await update.message.reply_text(
+            explanation[:4000],
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=kb(uid)
+        )
 
         # Шаг 3: Предложить уточнить
         keyboard = ReplyKeyboardMarkup([["Да", "Нет"]], resize_keyboard=True, one_time_keyboard=True)
@@ -260,16 +272,19 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = await file.download_as_bytearray()
         img = Image.open(io.BytesIO(data))
         ocr_text = pytesseract.image_to_string(img, lang="rus+eng")
-        log.info(f"OCR uid={uid} text={ocr_text.strip()!r}")
+        ocr_text = ocr_text.strip()
+        log.info(f"OCR uid={uid} text={ocr_text!r}")
 
-        if not ocr_text.strip():
+        if not ocr_text:
             raise ValueError("OCR returned empty text")
 
-        await update.message.reply_text(f"🔎 Распознанный текст:\n{ocr_text.strip()}", reply_markup=kb(uid))
-
         out = await gpt_explain(uid, ocr_text)
-        
-        await update.message.reply_text(out[:4000], reply_markup=kb(uid), parse_mode="HTML", disable_web_page_preview=True)
+        await update.message.reply_text(
+            out[:4000],
+            reply_markup=kb(uid),
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
     except Exception:
         log.exception("photo")
         keyboard = ReplyKeyboardMarkup(
@@ -286,7 +301,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- Текст и кнопки ----------
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    text = (update.message.text or "").strip().lower()
+    raw_text = (update.message.text or "").strip()
+    text = raw_text.lower()
     state = USER_STATE[uid]
 
     # Обработка выбора после фото
@@ -342,20 +358,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Состояния
     if state == "AWAIT_EXPLAIN":
         USER_STATE[uid] = None
-        context.args = [text]
+        context.args = [raw_text]
         return await explain_cmd(update, context)
     if state == "AWAIT_ESSAY":
         USER_STATE[uid] = None
-        context.args = [text]
+        context.args = [raw_text]
         return await essay_cmd(update, context)
 
     # Любой текст = объяснить
-    context.args = [text]
+    context.args = [raw_text]
     return await explain_cmd(update, context)
 
 # ---------- MAIN ----------
 def main():
-    threading.Thread(target=_run_health, daemon=True).start()
+    threading.Thread(target(_run_health, daemon=True).start()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.post_init = set_commands
 
