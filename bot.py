@@ -40,12 +40,13 @@ def _run_health():
 SUBJECTS = {
     "математика", "русский", "английский", "физика", "химия",
     "история", "обществознание", "биология", "информатика",
-    "география", "литература", "auto"
+    "география", "литература", "auto",
+    "беларуская мова", "беларуская літаратура"
 }
 USER_SUBJECT = defaultdict(lambda: "auto")
 USER_GRADE = defaultdict(lambda: "8")
 PARENT_MODE = defaultdict(lambda: False)
-USER_STATE = defaultdict(lambda: None)  # None | "AWAIT_EXPLAIN" | "AWAIT_ESSAY"
+USER_STATE = defaultdict(lambda: None)  # None | "AWAIT_EXPLAIN" | "AWAIT_ESSAY" | "AWAIT_FOLLOWUP" | "AWAIT_TEXT_OR_PHOTO_CHOICE"
 
 def kb(uid: int) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -61,13 +62,28 @@ def sys_prompt(uid: int) -> str:
     subject = USER_SUBJECT[uid]
     grade = USER_GRADE[uid]
     parent = PARENT_MODE[uid]
+
+    # Поддержка белорусского языка
+    if subject in ["беларуская мова", "беларуская літаратура"]:
+        return (
+            "Ты — ІІ-памочнік па беларускай мове і літаратуры. "
+            "Адказвай на беларускай, калі заданне на беларускай. "
+            "Калі на расейскай — адказвай на расейскай. "
+            "Памятай пра правілы: літара 'ў', мяккі знак, і інш."
+        )
+
     base = (
         "Ты — ИИ-репетитор. Объясняй как старший брат: просто, по шагам, с короткими аналогиями. "
-        "Структура: 1) Условие → 2) Решение → 3) Кратко. Добавляй 1–2 вопроса."
+        "Структура: 1) Условие → 2) Решение → 3) Кратко. Добавляй 1–2 вопроса ПО ЭТОМУ ЗАДАНИЮ."
     )
     sub = f"Предмет: {subject}." if subject != "auto" else "Определи сам."
     grd = f"Класс: {grade}."
-    par = "В конце добавь памятку для родителей." if parent else ""
+    par = (
+        "В конце добавь краткую памятку для родителей: "
+        "1) Какая тема изучается. "
+        "2) Что важно проверить у ребёнка. "
+        "3) Как мягко помочь, если не понимает."
+    ) if parent else ""
     return f"{base} {sub} {grd} {par}"
 
 # ---------- КОМАНДЫ ----------
@@ -81,13 +97,15 @@ async def set_commands(app: Application):
         BotCommand("parent", "Режим родителей on/off"),
         BotCommand("essay", "Сочинение: /essay ТЕМА"),
         BotCommand("explain", "Объяснить: /explain ТЕКСТ"),
+        BotCommand("about", "О боте и как пользоваться"),
     ])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     await update.message.reply_text(
         "👋 Привет! Я — *Готово!* Помогаю понять ДЗ.\n"
-        "Пиши текст, кидай фото или жми кнопки ниже.",
+        "Пиши текст, кидай фото или жми кнопки ниже.\n\n"
+        "Нажми /help или /about, чтобы узнать, как я работаю.",
         reply_markup=kb(uid),
         parse_mode="Markdown"
     )
@@ -96,14 +114,31 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    await about_cmd(update, context)
+
+async def about_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Как пользоваться:\n"
-        "• Напиши, что непонятно — объясню по-простому.\n"
-        "• Пришли фото — распознаю и решу по шагам.\n"
-        "• /essay ТЕМА — сочинение 150–200 слов.\n"
-        "• /subject ПРЕДМЕТ|auto  • /grade 5–11  • /parent on|off",
-        reply_markup=kb(uid)
+        "📘 *О боте «Готово!»*\n\n"
+        "Я — школьный помощник, который помогает с домашкой, "
+        "объясняя как старший брат: просто, по шагам, без воды.\n\n"
+
+        "🎯 *Что я умею:*\n"
+        "• 📸 Присылай фото задания — я его распознаю, решу и объясню\n"
+        "• 🧠 Напиши /explain — объясню любую тему\n"
+        "• 📝 Напиши /essay — напишу сочинение\n"
+        "• 📚 Можешь выбрать предмет и класс\n"
+        "• 👨‍👩‍👧 Включи режим для родителей — получишь памятку\n\n"
+
+        "📌 *Как пользоваться:*\n"
+        "1. Жми кнопки в меню\n"
+        "2. Или пиши команду: /help, /essay, /explain\n"
+        "3. После ответа — можешь уточнить: «Да» или «Нет»\n\n"
+
+        "💡 *Совет:* Если фото не распознал — попробуй переснять или напиши текстом.\n\n"
+
+        "Создан для учеников 5–11 классов. © 2025",
+        parse_mode="Markdown",
+        reply_markup=kb(update.effective_user.id)
     )
 
 async def subject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -128,7 +163,8 @@ async def parent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or context.args[0].lower() not in {"on", "off"}:
         return await update.message.reply_text("Используй: /parent on  или  /parent off")
     PARENT_MODE[uid] = (context.args[0].lower() == "on")
-    await update.message.reply_text(f"Режим для родителей: {'вкл' if PARENT_MODE[uid] else 'выкл'}", reply_markup=kb(uid))
+    status = "вкл" if PARENT_MODE[uid] else "выкл"
+    await update.message.reply_text(f"Режим для родителей: {status}", reply_markup=kb(uid))
 
 # ---------- GPT-хелперы ----------
 async def gpt_explain(uid: int, prompt: str) -> str:
@@ -168,6 +204,9 @@ async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         out = await gpt_explain(uid, text)
         await update.message.reply_text(out[:4000], reply_markup=kb(uid))
+        keyboard = ReplyKeyboardMarkup([["Да", "Нет"]], resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text("Хочешь уточнить что-то по этому заданию?", reply_markup=keyboard)
+        USER_STATE[uid] = "AWAIT_FOLLOWUP"
     except Exception as e:
         log.exception("explain")
         await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=kb(uid))
@@ -182,6 +221,9 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         out = await gpt_essay(uid, topic)
         await update.message.reply_text(out[:4000], reply_markup=kb(uid))
+        keyboard = ReplyKeyboardMarkup([["Да", "Нет"]], resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text("Хочешь уточнить по сочинению?", reply_markup=keyboard)
+        USER_STATE[uid] = "AWAIT_FOLLOWUP"
     except Exception as e:
         log.exception("essay")
         await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=kb(uid))
@@ -189,48 +231,102 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     try:
-        log.info(f"PHOTO received from uid={uid}")
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         file = await update.message.photo[-1].get_file()
         data = await file.download_as_bytearray()
         b64 = base64.b64encode(data).decode("utf-8")
 
-        msgs = [
-            {"role": "system", "content": sys_prompt(uid)},
-            {"role": "user", "content": [
-                {"type": "text", "text": "Распознай задание с фото, реши и объясни по шагам."},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-            ]}
-        ]
-        resp = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=msgs,
-            temperature=0.2,
-            max_tokens=1200
+        # Анализ: сколько заданий?
+        analysis_prompt = (
+            "Проанализируй фото. Сколько отдельных заданий ты видишь? "
+            "Перечисли кратко: 1) ..., 2) ..., 3) ... "
+            "Если неясно — скажи: 'Не удаётся разобрать задания'."
         )
-        out = resp.choices[0].message.content.strip()
-        await update.message.reply_text(out[:4000], reply_markup=kb(uid))
+        analysis_resp = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "Ты анализируешь школьные задания."},
+                {"role": "user", "content": [
+                    {"type": "text", "text": analysis_prompt},
+                    {"type": "image_url", "image_url": {"url": f"image/jpeg;base64,{b64}"}}
+                ]}
+            ],
+            max_tokens=500
+        )
+        analysis = analysis_resp.choices[0].message.content.strip()
+
+        if "не удаётся разобрать" not in analysis.lower() and "неясно" not in analysis.lower():
+            await update.message.reply_text(
+                f"Я вижу несколько заданий:\n\n{analysis}\n\n"
+                "Какое хочешь решить? Напиши номер или условие."
+            )
+            USER_STATE[uid] = "AWAIT_EXPLAIN"
+            return
+
+        # Если не получилось — предложить альтернативу
+        keyboard = ReplyKeyboardMarkup(
+            [["📸 Решить по фото", "✍️ Напишу текстом"]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+        await update.message.reply_text(
+            "К сожалению, не удалось разобрать задание по фото.\n\n"
+            "Выбери, как удобнее:",
+            reply_markup=keyboard
+        )
+        USER_STATE[uid] = "AWAIT_TEXT_OR_PHOTO_CHOICE"
+
     except Exception as e:
         log.exception("photo")
-        await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=kb(uid))
+        keyboard = ReplyKeyboardMarkup(
+            [["📸 Решить по фото", "✍️ Напишу текстом"]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+        await update.message.reply_text(
+            "Не удалось обработать фото. Попробуй ещё раз или введи текстом:",
+            reply_markup=keyboard
+        )
+        USER_STATE[uid] = "AWAIT_TEXT_OR_PHOTO_CHOICE"
 
 # ---------- Текст и кнопки ----------
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    text = (update.message.text or "").strip()
-    log.info(f"TEXT uid={uid} state={USER_STATE[uid]} text={text!r}")
+    text = (update.message.text or "").strip().lower()
+    state = USER_STATE[uid]
+
+    # Обработка выбора после фото
+    if state == "AWAIT_TEXT_OR_PHOTO_CHOICE":
+        if text == "📸 решить по фото":
+            USER_STATE[uid] = None
+            return await update.message.reply_text("Хорошо! Пришли фото задания.", reply_markup=kb(uid))
+        elif text == "✍️ напишу текстом":
+            USER_STATE[uid] = "AWAIT_EXPLAIN"
+            return await update.message.reply_text("Напиши задание текстом — я помогу.", reply_markup=kb(uid))
+        else:
+            return await update.message.reply_text("Выбери: 'Решить по фото' или 'Напишу текстом'")
+
+    # Обработка уточнения
+    if state == "AWAIT_FOLLOWUP":
+        if text == "да":
+            USER_STATE[uid] = "AWAIT_EXPLAIN"
+            return await update.message.reply_text("Что именно непонятно?", reply_markup=kb(uid))
+        elif text == "нет":
+            USER_STATE[uid] = None
+            return await update.message.reply_text("Хорошо! Если что — пиши снова.", reply_markup=kb(uid))
+        else:
+            return await update.message.reply_text("Ответь: Да или Нет")
 
     # Кнопки
-    if text == "🧠 Объяснить":           return await explain_cmd(update, context)
-    if text == "📝 Сочинение":           return await essay_cmd(update, context)
-    if text == "📸 Фото задания":        return await update.message.reply_text("Отправь фото сообщением — я распознаю и объясню.", reply_markup=kb(uid))
-    if text.startswith("📚 Предмет:"):   return await update.message.reply_text("Сменить: /subject <название|auto>", reply_markup=kb(uid))
-    if text.startswith("🎓 Класс:"):     return await update.message.reply_text("Сменить: /grade 5–11", reply_markup=kb(uid))
-    if text.startswith("👨‍👩‍👧 Родит.:"): return await update.message.reply_text("Вкл/выкл: /parent on|off", reply_markup=kb(uid))
-    if text in {"📋 Меню /menu", "ℹ️ Помощь"}: return await help_cmd(update, context)
+    if text == "🧠 объяснить":           return await explain_cmd(update, context)
+    if text == "📝 сочинение":           return await essay_cmd(update, context)
+    if text == "📸 фото задания":        return await update.message.reply_text("Отправь фото сообщением — я распознаю и объясню.", reply_markup=kb(uid))
+    if text.startswith("📚 предмет:"):   return await update.message.reply_text("Сменить: /subject <название|auto>", reply_markup=kb(uid))
+    if text.startswith("🎓 класс:"):     return await update.message.reply_text("Сменить: /grade 5–11", reply_markup=kb(uid))
+    if text.startswith("👨‍👩‍👧 родит.:"): return await update.message.reply_text("Вкл/выкл: /parent on|off", reply_markup=kb(uid))
+    if text in {"📋 меню /menu", "ℹ️ помощь"}: return await help_cmd(update, context)
 
     # Состояния
-    state = USER_STATE[uid]
     if state == "AWAIT_EXPLAIN":
         USER_STATE[uid] = None
         context.args = [text]
@@ -254,6 +350,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("about", about_cmd))
     app.add_handler(CommandHandler("subject", subject_cmd))
     app.add_handler(CommandHandler("grade", grade_cmd))
     app.add_handler(CommandHandler("parent", parent_cmd))
