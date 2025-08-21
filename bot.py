@@ -1,5 +1,5 @@
 import os
-import base64
+import io
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -9,7 +9,8 @@ from telegram import Update, BotCommand, ReplyKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from openai import AsyncOpenAI
-
+from PIL import Image
+import pytesseract
 # ---------- ЛОГИ ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("gotovo-bot")
@@ -257,23 +258,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         file = await update.message.photo[-1].get_file()
         data = await file.download_as_bytearray()
-        b64 = base64.b64encode(data).decode("utf-8")
-        image_url = f"data:image/jpeg;base64,{b64}"
+        img = Image.open(io.BytesIO(data))
+        ocr_text = pytesseract.image_to_string(img, lang="rus+eng")
+        log.info(f"OCR uid={uid} text={ocr_text.strip()!r}")
 
-        msgs = [
-            {"role": "system", "content": sys_prompt(uid)},
-            {"role": "user", "content": [
-                {"type": "text", "text": "Распознай задание с фото, реши и объясни по шагам. Ответ должен использовать только HTML-теги для форматирования: <b>жирный</b>, <i>курсив</i>, <code>моноширинный</code>. Не используй Markdown (**, *, `)."},
-                {"type": "image_url", "image_url": {"url": image_url}}
-            ]}
-        ]
-        resp = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=msgs,
-            temperature=0.2,
-            max_tokens=1200
-        )
-        out = resp.choices[0].message.content.strip()
+        if not ocr_text.strip():
+            raise ValueError("OCR returned empty text")
+
+        await update.message.reply_text(f"🔎 Распознанный текст:\n{ocr_text.strip()}", reply_markup=kb(uid))
+
+        out = await gpt_explain(uid, ocr_text)
+        
         await update.message.reply_text(out[:4000], reply_markup=kb(uid), parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         log.exception("photo")
