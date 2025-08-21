@@ -4,7 +4,7 @@ import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import defaultdict
-from io import BytesIO
+
 from telegram import Update, BotCommand, ReplyKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -69,7 +69,10 @@ def sys_prompt(uid: int) -> str:
             "Ты — ІІ-памочнік па беларускай мове і літаратуры. "
             "Адказвай на беларускай, калі заданне на беларускай. "
             "Калі на расейскай — адказвай на расейскай. "
-            "Памятай пра правілы: літара 'ў', мяккі знак, і інш."
+            "Памятай пра правілы: літара 'ў', мяккі знак, і інш. "
+            "Адказ пішы толькі на беларускай мове. "
+            "Выкарыстоўвай толькі HTML-тэгі для фарматавання: <b>тлусты</b>, <i>курсіў</i>, <code>код</code>. "
+            "Не выкарыстоўвай Markdown (**, *, `)."
         )
 
     base = (
@@ -77,14 +80,16 @@ def sys_prompt(uid: int) -> str:
         "Структура: 1) Условие → 2) Решение по шагам (с объяснением каждого действия) → 3) Кратко (для тех, кто не понял с первого раза). "
         "Добавляй 1–2 вопроса ПО ЭТОМУ ЗАДАНИЮ — с подсказками, не давая полный ответ. "
         "Не задавай общие вопросы. Не уходи в темы, не связанные с заданием. "
-        "Не вступай в диалог. Вопрос — это часть объяснения, не приглашение к беседе."
+        "Не вступай в диалог. Вопрос — это часть объяснения, не приглашение к беседе. "
+        "Ответ должен использовать только HTML-теги для форматирования: <b>жирный</b>, <i>курсив</i>, <code>моноширинный</code>. "
+        "Не используй Markdown (**, *, `)."
     )
     sub = f"Предмет: {subject}." if subject != "auto" else "Определи сам."
     grd = f"Класс: {grade}."
     par = (
-        "В конце добавь краткую памятку для родителей: "
-        "1) Какая тема изучается. "
-        "2) Что важно проверить у ребёнка. "
+        "<b>Памятка для родителей:</b><br>"
+        "1) Какая тема изучается.<br>"
+        "2) Что важно проверить у ребёнка.<br>"
         "3) Как мягко помочь, если не понимает."
     ) if parent else ""
     return f"{base} {sub} {grd} {par}"
@@ -106,11 +111,10 @@ async def set_commands(app: Application):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     await update.message.reply_text(
-        "👋 Привет! Я — *Готово!* Помогаю понять ДЗ.\n"
-        "Пиши текст, кидай фото или жми кнопки ниже.\n\n"
-        "Нажми /help или /about, чтобы узнать, как я работаю.",
+        "👋 Привет! Я — <b>Готово!</b> Помогаю понять ДЗ.\n"
+        "Пиши текст, кидай фото или жми кнопки ниже.",
         reply_markup=kb(uid),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -121,50 +125,50 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def about_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📘 *О боте «Готово!»*\n\n"
+        "<b>📘 О боте «Готово!»</b>\n\n"
         "Я — школьный помощник, который помогает с домашкой, "
         "объясняя как старший брат: просто, по шагам, без воды.\n\n"
 
-        "🎯 *Что я умею:*\n"
+        "<b>🎯 Что я умею:</b>\n"
         "• 📸 Присылай фото задания — я его распознаю, решу и объясню\n"
         "• 🧠 Напиши /explain — объясню любую тему\n"
         "• 📝 Напиши /essay — напишу сочинение\n"
         "• 📚 Можешь выбрать предмет и класс\n"
         "• 👨‍👩‍👧 Включи режим для родителей — получишь памятку\n\n"
 
-        "📌 *Как пользоваться:*\n"
+        "<b>📌 Как пользоваться:</b>\n"
         "1. Жми кнопки в меню\n"
         "2. Или пиши команду: /help, /essay, /explain\n"
         "3. После ответа — можешь уточнить: «Да» или «Нет»\n\n"
 
-        "💡 *Совет:* Если фото не распознал — попробуй переснять или напиши текстом.\n\n"
+        "<b>💡 Совет:</b> Если фото не распознал — попробуй переснять или напиши текстом.\n\n"
 
         "Создан для учеников 5–11 классов. © 2025",
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=kb(update.effective_user.id)
     )
 
 async def subject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not context.args:
-        return await update.message.reply_text("Доступно: " + ", ".join(sorted(SUBJECTS)))
+        return await update.message.reply_text("Доступно: " + ", ".join(sorted(SUBJECTS)), reply_markup=kb(uid))
     val = " ".join(context.args).strip().lower()
     if val not in SUBJECTS:
-        return await update.message.reply_text("Не понял предмет. Доступно: " + ", ".join(sorted(SUBJECTS)))
+        return await update.message.reply_text("Не понял предмет. Доступно: " + ", ".join(sorted(SUBJECTS)), reply_markup=kb(uid))
     USER_SUBJECT[uid] = val
     await update.message.reply_text(f"Предмет: {val}", reply_markup=kb(uid))
 
 async def grade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not context.args or context.args[0] not in [str(i) for i in range(5, 12)]:
-        return await update.message.reply_text("Пример: /grade 7")
+        return await update.message.reply_text("Пример: /grade 7", reply_markup=kb(uid))
     USER_GRADE[uid] = context.args[0]
     await update.message.reply_text(f"Класс: {USER_GRADE[uid]}", reply_markup=kb(uid))
 
 async def parent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not context.args or context.args[0].lower() not in {"on", "off"}:
-        return await update.message.reply_text("Используй: /parent on  или  /parent off")
+        return await update.message.reply_text("Используй: /parent on  или  /parent off", reply_markup=kb(uid))
     PARENT_MODE[uid] = (context.args[0].lower() == "on")
     status = "вкл" if PARENT_MODE[uid] else "выкл"
     await update.message.reply_text(f"Режим для родителей: {status}", reply_markup=kb(uid))
@@ -188,7 +192,7 @@ async def gpt_essay(uid: int, topic: str) -> str:
     resp = await client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": f"Ты — ученик {USER_GRADE[uid]} класса. Пиши сочинение как ученик: просто, по делу, 150–200 слов. Без вступлений в диалог."},
+            {"role": "system", "content": f"Ты — ученик {USER_GRADE[uid]} класса. Пиши сочинение как ученик: просто, по делу, 150–200 слов. Без вступлений в диалог. Ответ должен использовать только HTML-теги для форматирования: <b>жирный</b>, <i>курсив</i>, <code>моноширинный</code>. Не используй Markdown (**, *, `)."},
             {"role": "user", "content": f"Напиши сочинение. Тема: {topic}"}
         ],
         temperature=0.7,
@@ -206,7 +210,7 @@ async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         out = await gpt_explain(uid, text)
-        await update.message.reply_text(out[:4000], reply_markup=kb(uid))
+        await update.message.reply_text(out[:4000], reply_markup=kb(uid), parse_mode="HTML", disable_web_page_preview=True)
         keyboard = ReplyKeyboardMarkup([["Да", "Нет"]], resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("Хочешь уточнить что-то по этому заданию?", reply_markup=keyboard)
         USER_STATE[uid] = "AWAIT_FOLLOWUP"
@@ -219,23 +223,24 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     topic = " ".join(context.args).strip()
     if not topic:
         USER_STATE[uid] = "AWAIT_ESSAY"
-        return await update.message.reply_text("📝 Напиши тему сочинения.", reply_markup=kb(uid))
+        return await update.message.reply_text("📝 Тема сочинения?", reply_markup=kb(uid))
     
     try:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         
         # Шаг 1: Написать сочинение
         essay = await gpt_essay(uid, topic)
-        await update.message.reply_text(essay[:4000], parse_mode="MarkdownV2", disable_web_page_preview=True)
+        await update.message.reply_text(essay[:4000], parse_mode="HTML", disable_web_page_preview=True)
 
         # Шаг 2: Объяснить, как писать такие сочинения
         explain_prompt = (
             f"Объясни, как написать сочинение на тему: '{topic}'. "
             "Структура: 1) Условие → 2) Решение по шагам (как построить текст) → 3) Кратко. "
-            "Добавь 1–2 вопроса для закрепления."
+            "Добавь 1–2 вопроса для закрепления. "
+            "Ответ должен использовать только HTML-теги для форматирования: <b>жирный</b>, <i>курсив</i>, <code>моноширинный</code>. Не используй Markdown (**, *, `)."
         )
         explanation = await gpt_explain(uid, explain_prompt)
-        await update.message.reply_text(explanation[:4000], parse_mode="MarkdownV2", disable_web_page_preview=True)
+        await update.message.reply_text(explanation[:4000], parse_mode="HTML", disable_web_page_preview=True)
 
         # Шаг 3: Предложить уточнить
         keyboard = ReplyKeyboardMarkup([["Да", "Нет"]], resize_keyboard=True, one_time_keyboard=True)
@@ -246,46 +251,32 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("essay")
         await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=kb(uid))
 
-
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-        
-        # Скачиваем файл
-        photo_file = await update.message.photo[-1].get_file()
-        img_data = await photo_file.download_as_bytearray()
-        
-        # Кодируем в base64
-        b64_image = base64.b64encode(img_data).decode('utf-8')
-        image_url = f"data:image/jpeg;base64,{b64_image}"
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+        file = await update.message.photo[-1].get_file()
+        data = await file.download_as_bytearray()
+        b64 = base64.b64encode(data).decode("utf-8")
+        image_url = f"data:image/jpeg;base64,{b64}"
 
-        # Подготавливаем сообщение для GPT
-        messages = [
+        msgs = [
             {"role": "system", "content": sys_prompt(uid)},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Распознай задание с фото, реши и объясни по шагам."},
-                    {"type": "image_url", "image_url": {"url": image_url}}
-                ]
-            }
+            {"role": "user", "content": [
+                {"type": "text", "text": "Распознай задание с фото, реши и объясни по шагам. Ответ должен использовать только HTML-теги для форматирования: <b>жирный</b>, <i>курсив</i>, <code>моноширинный</code>. Не используй Markdown (**, *, `)."},
+                {"type": "image_url", "image_url": {"url": image_url}}
+            ]}
         ]
-
-        # Отправляем запрос к GPT-4o
-        response = await client.chat.completions.create(
-            model="gpt-4o",  # Используем актуальную модель
-            messages=messages,
-            max_tokens=1200,
-            temperature=0.2
+        resp = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=msgs,
+            temperature=0.2,
+            max_tokens=1200
         )
-
-        # Получаем ответ
-        answer = response.choices[0].message.content.strip()
-        await update.message.reply_text(answer[:4000], parse_mode='MarkdownV2', disable_web_page_preview=True)
-
+        out = resp.choices[0].message.content.strip()
+        await update.message.reply_text(out[:4000], reply_markup=kb(uid), parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
-        log.error(f"Ошибка при обработке фото: {e}", exc_info=True)
+        log.exception("photo")
         keyboard = ReplyKeyboardMarkup(
             [["📸 Решить по фото", "✍️ Напишу текстом"]],
             resize_keyboard=True,
