@@ -9,11 +9,11 @@ from collections import defaultdict
 
 from telegram import Update, BotCommand, ReplyKeyboardMarkup
 from telegram.constants import ChatAction
+from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from openai import AsyncOpenAI
 from PIL import Image
 import pytesseract
-from xml.etree.ElementTree import XMLParser, fromstring, ParseError
 
 # ---------- ЛОГИ ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -63,63 +63,50 @@ def kb(uid: int) -> ReplyKeyboardMarkup:
         resize_keyboard=True
     )
 
-# ---------- Утилита HTML ----------
-# --- Надёжная очистка HTML ---
-class _MLStripper:
-    def __init__(self):
-        from html.parser import HTMLParser
-        class MLStripper(HTMLParser):
-            def __init__(self):
-                super().__init__()
-                self.reset()
-                self.fed = []
-            def handle_data(self, d):
-                self.fed.append(d)
-            def get_data(self):
-                return ''.join(self.fed)
-        self.s = MLStripper()
+# ---------- НАДЁЖНАЯ ОЧИСТКА HTML ----------
+ALLOWED_TAGS = {"b", "i", "code", "pre"}  # <a> убираем — не нужен и может ломать Telegram
 
-    def feed(self, data):
-        self.s.feed(data)
-
-    def get_data(self):
-        return self.s.get_data()
-
-def strip_tags(html):
-    s = _MLStripper()
-    s.feed(html)
-    return s.get_data()
-
-ALLOWED_TAGS = {"b", "i", "a", "code", "pre"}
+_TAG_OPEN = {t: f"&lt;{t}&gt;" for t in ALLOWED_TAGS}
+_TAG_CLOSE = {t: f"&lt;/{t}&gt;" for t in ALLOWED_TAGS}
 
 def sanitize_html(text: str) -> str:
-    """Очищает HTML от запрещённых тегов и закрывает незакрытые"""
+    """Экранируем всё и точечно возвращаем только <b>, <i>, <code>, <pre>."""
+    if not text:
+        return ""
+    # 0) убрать нули и нормализовать переносы
+    text = text.replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
+    # 1) унифицировать <br> в перенос строки
+    text = re.sub(r"<\s*br\s*/?\s*>", "\n", text, flags=re.I)
+    # 2) экранировать всё как текст
+    escaped = html.escape(text, quote=False)
+    # 3) вернуть whitelisted теги (без атрибутов)
+    for t in ALLOWED_TAGS:
+        escaped = re.sub(
+            fr"{_TAG_OPEN[t]}(.*?){_TAG_CLOSE[t]}",
+            fr"<{t}>\1</{t}>",
+            escaped,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    # 4) ограничить длину безопасного HTML
+    return escaped[:4000]
+
+async def safe_reply_html(message, text: str, **kwargs):
+    """Пробуем отправить как HTML; при ошибке Telegram шлём как обычный текст."""
     try:
-        # Пытаемся распарсить как XML (проще контролировать)
-        parser = XMLParser(encoding="utf-8")
-        # Оборачиваем в корень, чтобы не ругался на несколько корней
-        wrapped = f"<root>{text}</root>"
-        tree = fromstring(wrapped, parser=parser)
-        
-        def clean_element(el):
-            if el.tag in ALLOWED_TAGS:
-                # Сохраняем тег
-                inner = "".join(clean_element(e) for e in el)
-                attrs = " ".join(f'{k}="{v}"' for k, v in el.attrib.items())
-                if attrs:
-                    return f"<{el.tag} {attrs}>{inner}</{el.tag}>"
-                else:
-                    return f"<{el.tag}>{inner}</{el.tag}>"
-            else:
-                # Убираем тег, оставляем только текст
-                return "".join(clean_element(e) for e in el) + (el.text or "") + (el.tail or "")
-
-        result = "".join(clean_element(e) for e in tree)
-        return result
-    except ParseError:
-        # Если не смогли распарсить — просто убираем все теги
-        return strip_tags(text)
-
+        return await message.reply_text(
+            sanitize_html(text),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            **kwargs
+        )
+    except BadRequest as e:
+        if "Can't parse entities" in str(e):
+            return await message.reply_text(
+                html.escape(text)[:4000],
+                disable_web_page_preview=True,
+                **kwargs
+            )
+        raise
 
 def sys_prompt(uid: int) -> str:
     subject = USER_SUBJECT[uid]
@@ -173,11 +160,11 @@ async def set_commands(app: Application):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    await update.message.reply_text(
+    await safe_reply_html(
+        update.message,
         "👋 Привет! Я — <b>Готово!</b> Помогаю понять ДЗ.\n"
         "Пиши текст, кидай фото или жми кнопки ниже.",
-        reply_markup=kb(uid),
-        parse_mode="HTML"
+        reply_markup=kb(uid)
     )
 
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -187,7 +174,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await about_cmd(update, context)
 
 async def about_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    await safe_reply_html(
+        update.message,
         "<b>📘 О боте «Готово!»</b>\n\n"
         "Я — школьный помощник, который помогает с домашкой, "
         "объясняя как старший брат: просто, по шагам, без воды.\n\n"
@@ -207,7 +195,6 @@ async def about_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>💡 Совет:</b> Если фото не распознал — попробуй переснять или напиши текстом.\n\n"
 
         "Создан для учеников 5–11 классов. © 2025",
-        parse_mode="HTML",
         reply_markup=kb(update.effective_user.id)
     )
 
@@ -274,10 +261,7 @@ async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         out = await gpt_explain(uid, text)
-        sanitized = sanitize_html(out)
-        await update.message.reply_text(
-            sanitized[:4000], reply_markup=kb(uid), parse_mode="HTML", disable_web_page_preview=True
-        )
+        await safe_reply_html(update.message, out, reply_markup=kb(uid))
         keyboard = ReplyKeyboardMarkup([["Да", "Нет"]], resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("Хочешь уточнить что-то по этому заданию?", reply_markup=keyboard)
         USER_STATE[uid] = "AWAIT_FOLLOWUP"
@@ -296,13 +280,7 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Шаг 1: Сочинение
         essay = await gpt_essay(uid, topic)
-        essay = sanitize_html(essay)
-        await update.message.reply_text(
-            essay[:4000],
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            reply_markup=kb(uid)
-        )
+        await safe_reply_html(update.message, essay, reply_markup=kb(uid))
 
         # Шаг 2: План
         plan_prompt = (
@@ -310,13 +288,7 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Каждый пункт короткий. Используй только HTML-теги <b>, <i>, <code>."
         )
         plan = await gpt_explain(uid, plan_prompt, prepend_prompt=False)
-        plan = sanitize_html(plan)
-        await update.message.reply_text(
-            plan[:4000],
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            reply_markup=kb(uid)
-        )
+        await safe_reply_html(update.message, plan, reply_markup=kb(uid))
 
         # Шаг 3: Обоснование структуры
         reason_prompt = (
@@ -324,13 +296,7 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Ответ должен использовать только HTML-теги <b>, <i>, <code>."
         )
         reason = await gpt_explain(uid, reason_prompt, prepend_prompt=False)
-        reason = sanitize_html(reason)
-        await update.message.reply_text(
-            reason[:4000],
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            reply_markup=kb(uid)
-        )
+        await safe_reply_html(update.message, reason, reply_markup=kb(uid))
 
         # Шаг 4: Уточнение
         keyboard = ReplyKeyboardMarkup([["Да", "Нет"]], resize_keyboard=True, one_time_keyboard=True)
@@ -355,13 +321,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         ocr_text = ocr_text[:4000]  # ограничение длины
         out = await gpt_explain(uid, ocr_text)
-        sanitized = sanitize_html(out)
-        await update.message.reply_text(
-            sanitized[:4000],
-            reply_markup=kb(uid),
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
+        await safe_reply_html(update.message, out, reply_markup=kb(uid))
     except Exception:
         log.exception("photo")
         keyboard = ReplyKeyboardMarkup(
