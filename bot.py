@@ -1,5 +1,7 @@
 import os
 import io
+import re
+import html
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -60,12 +62,23 @@ def kb(uid: int) -> ReplyKeyboardMarkup:
         resize_keyboard=True
     )
 
+# ---------- Утилита HTML ----------
+TAG_RE = re.compile(r"</?([a-zA-Z0-9]+)[^>]*>")
+ALLOWED_TAGS = {"b", "i", "code"}
+
+def sanitize_html(text: str) -> str:
+    def repl(match):
+        tag = match.group(1).lower()
+        if tag in ALLOWED_TAGS:
+            return match.group(0)
+        return html.escape(match.group(0))
+    return TAG_RE.sub(repl, text)
+
 def sys_prompt(uid: int) -> str:
     subject = USER_SUBJECT[uid]
     grade = USER_GRADE[uid]
     parent = PARENT_MODE[uid]
 
-    # Поддержка белорусского языка
     if subject in ["беларуская мова", "беларуская літаратура"]:
         return (
             "Ты — ІІ-памочнік па беларускай мове і літаратуры. "
@@ -213,7 +226,10 @@ async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         out = await gpt_explain(uid, text)
-        await update.message.reply_text(out[:4000], reply_markup=kb(uid), parse_mode="HTML", disable_web_page_preview=True)
+        sanitized = sanitize_html(out)
+        await update.message.reply_text(
+            sanitized[:4000], reply_markup=kb(uid), parse_mode="HTML", disable_web_page_preview=True
+        )
         keyboard = ReplyKeyboardMarkup([["Да", "Нет"]], resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("Хочешь уточнить что-то по этому заданию?", reply_markup=keyboard)
         USER_STATE[uid] = "AWAIT_FOLLOWUP"
@@ -227,12 +243,12 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not topic:
         USER_STATE[uid] = "AWAIT_ESSAY"
         return await update.message.reply_text("📝 Тема сочинения?", reply_markup=kb(uid))
-    
     try:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-        
-        # Шаг 1: Написать сочинение
+
+        # Шаг 1: Сочинение
         essay = await gpt_essay(uid, topic)
+        essay = sanitize_html(essay)
         await update.message.reply_text(
             essay[:4000],
             parse_mode="HTML",
@@ -240,26 +256,38 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb(uid)
         )
 
-        # Шаг 2: Объяснить, как писать такие сочинения
-        explain_prompt = (
-            f"Объясни, как написать сочинение на тему: '{topic}'. "
-            "Структура: 1) Условие → 2) Решение по шагам (как построить текст) → 3) Кратко. "
-            "Добавь 1–2 вопроса для закрепления. "
-            "Ответ должен использовать только HTML-теги для форматирования: <b>жирный</b>, <i>курсив</i>, <code>моноширинный</code>. Не используй Markdown (**, *, `)."
+        # Шаг 2: План
+        plan_prompt = (
+            f"Составь нумерованный план сочинения на тему '{topic}'. "
+            "Каждый пункт короткий. Используй только HTML-теги <b>, <i>, <code>."
         )
-        explanation = await gpt_explain(uid, explain_prompt, prepend_prompt=False)
+        plan = await gpt_explain(uid, plan_prompt, prepend_prompt=False)
+        plan = sanitize_html(plan)
         await update.message.reply_text(
-            explanation[:4000],
+            plan[:4000],
             parse_mode="HTML",
             disable_web_page_preview=True,
             reply_markup=kb(uid)
         )
 
-        # Шаг 3: Предложить уточнить
+        # Шаг 3: Обоснование структуры
+        reason_prompt = (
+            f"Кратко объясни, почему для сочинения на тему '{topic}' выбран такой план. "
+            "Ответ должен использовать только HTML-теги <b>, <i>, <code>."
+        )
+        reason = await gpt_explain(uid, reason_prompt, prepend_prompt=False)
+        reason = sanitize_html(reason)
+        await update.message.reply_text(
+            reason[:4000],
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=kb(uid)
+        )
+
+        # Шаг 4: Уточнение
         keyboard = ReplyKeyboardMarkup([["Да", "Нет"]], resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("Хочешь уточнить по сочинению?", reply_markup=keyboard)
         USER_STATE[uid] = "AWAIT_FOLLOWUP"
-
     except Exception as e:
         log.exception("essay")
         await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=kb(uid))
@@ -271,16 +299,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = await update.message.photo[-1].get_file()
         data = await file.download_as_bytearray()
         img = Image.open(io.BytesIO(data))
-        ocr_text = pytesseract.image_to_string(img, lang="rus+eng")
-        ocr_text = ocr_text.strip()
+        ocr_text = pytesseract.image_to_string(img, lang="rus+eng").strip()
         log.info(f"OCR uid={uid} text={ocr_text!r}")
 
         if not ocr_text:
             raise ValueError("OCR returned empty text")
 
+        ocr_text = ocr_text[:4000]  # ограничение длины
         out = await gpt_explain(uid, ocr_text)
+        sanitized = sanitize_html(out)
         await update.message.reply_text(
-            out[:4000],
+            sanitized[:4000],
             reply_markup=kb(uid),
             parse_mode="HTML",
             disable_web_page_preview=True
@@ -305,7 +334,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = raw_text.lower()
     state = USER_STATE[uid]
 
-    # Обработка выбора после фото
     if state == "AWAIT_TEXT_OR_PHOTO_CHOICE":
         if text == "📸 решить по фото":
             USER_STATE[uid] = None
@@ -316,7 +344,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             return await update.message.reply_text("Выбери: 'Решить по фото' или 'Напишу текстом'")
 
-    # Обработка уточнения
     if state == "AWAIT_FOLLOWUP":
         if text == "да":
             USER_STATE[uid] = "AWAIT_EXPLAIN"
@@ -327,7 +354,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             return await update.message.reply_text("Ответь: Да или Нет")
 
-    # Кнопки
     if text == "🧠 объяснить":
         return await explain_cmd(update, context)
     if text == "📝 сочинение":
@@ -355,7 +381,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in {"📋 меню /menu", "ℹ️ помощь"}:
         return await help_cmd(update, context)
 
-    # Состояния
     if state == "AWAIT_EXPLAIN":
         USER_STATE[uid] = None
         context.args = [raw_text]
@@ -365,17 +390,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.args = [raw_text]
         return await essay_cmd(update, context)
 
-    # Любой текст = объяснить
     context.args = [raw_text]
     return await explain_cmd(update, context)
 
 # ---------- MAIN ----------
 def main():
-    threading.Thread(target(_run_health, daemon=True).start()
+    threading.Thread(target=_run_health, daemon=True).start()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.post_init = set_commands
 
-    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -386,7 +409,6 @@ def main():
     app.add_handler(CommandHandler("essay", essay_cmd))
     app.add_handler(CommandHandler("explain", explain_cmd))
 
-    # Обработчики
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
