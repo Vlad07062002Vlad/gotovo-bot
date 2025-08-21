@@ -4,7 +4,7 @@ import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import defaultdict
-
+from io import BytesIO
 from telegram import Update, BotCommand, ReplyKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -246,33 +246,66 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("essay")
         await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=kb(uid))
 
+import base64
+import logging
+from io import BytesIO
+
+from telegram import Update, BotCommand, ReplyKeyboardMarkup
+from telegram.constants import ChatAction
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from openai import AsyncOpenAI
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from collections import defaultdict
+
+# ... (остальные импорты остаются прежними)
+
+# ---------- ЛОГИ ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("gotovo-bot")
+
+# ... (остальная часть кода до handle_photo)
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     try:
-        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-        file = await update.message.photo[-1].get_file()
-        data = await file.download_as_bytearray()
-        b64 = base64.b64encode(data).decode("utf-8")
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+        
+        # Скачиваем файл
+        photo_file = await update.message.photo[-1].get_file()
+        img_data = await photo_file.download_as_bytearray()
+        
+        # Кодируем в base64
+        b64_image = base64.b64encode(img_data).decode('utf-8')
+        image_url = f"data:image/jpeg;base64,{b64_image}"
 
-        # Просто распознаём и решаем — как раньше
-        msgs = [
+        # Подготавливаем сообщение для GPT
+        messages = [
             {"role": "system", "content": sys_prompt(uid)},
-            {"role": "user", "content": [
-                {"type": "text", "text": "Распознай задание с фото, реши и объясни по шагам."},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-            ]}
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Распознай задание с фото, реши и объясни по шагам."},
+                    {"type": "image_url", "image_url": {"url": image_url}}
+                ]
+            }
         ]
-        resp = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=msgs,
-            temperature=0.2,
-            max_tokens=1200
+
+        # Отправляем запрос к GPT-4o
+        response = await client.chat.completions.create(
+            model="gpt-4o",  # Используем актуальную модель
+            messages=messages,
+            max_tokens=1200,
+            temperature=0.2
         )
-        out = resp.choices[0].message.content.strip()
-        await update.message.reply_text(out[:4000], parse_mode="MarkdownV2", disable_web_page_preview=True)
+
+        # Получаем ответ
+        answer = response.choices[0].message.content.strip()
+        await update.message.reply_text(answer[:4000], parse_mode='MarkdownV2', disable_web_page_preview=True)
 
     except Exception as e:
-        log.exception("photo")
+        log.error(f"Ошибка при обработке фото: {e}", exc_info=True)
         keyboard = ReplyKeyboardMarkup(
             [["📸 Решить по фото", "✍️ Напишу текстом"]],
             resize_keyboard=True,
