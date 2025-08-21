@@ -13,6 +13,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 from openai import AsyncOpenAI
 from PIL import Image
 import pytesseract
+from xml.etree.ElementTree import XMLParser, fromstring, ParseError
 
 # ---------- ЛОГИ ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -63,22 +64,69 @@ def kb(uid: int) -> ReplyKeyboardMarkup:
     )
 
 # ---------- Утилита HTML ----------
-TAG_RE = re.compile(r"</?([a-zA-Z0-9]+)[^>]*>")
-ALLOWED_TAGS = {"b", "i", "code"}
+# --- Надёжная очистка HTML ---
+class _MLStripper:
+    def __init__(self):
+        from html.parser import HTMLParser
+        class MLStripper(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.reset()
+                self.fed = []
+            def handle_data(self, d):
+                self.fed.append(d)
+            def get_data(self):
+                return ''.join(self.fed)
+        self.s = MLStripper()
+
+    def feed(self, data):
+        self.s.feed(data)
+
+    def get_data(self):
+        return self.s.get_data()
+
+def strip_tags(html):
+    s = _MLStripper()
+    s.feed(html)
+    return s.get_data()
+
+ALLOWED_TAGS = {"b", "i", "a", "code", "pre"}
 
 def sanitize_html(text: str) -> str:
-    def repl(match):
-        tag = match.group(1).lower()
-        if tag in ALLOWED_TAGS:
-            return match.group(0)
-        return html.escape(match.group(0))
-    return TAG_RE.sub(repl, text)
+    """Очищает HTML от запрещённых тегов и закрывает незакрытые"""
+    try:
+        # Пытаемся распарсить как XML (проще контролировать)
+        parser = XMLParser(encoding="utf-8")
+        # Оборачиваем в корень, чтобы не ругался на несколько корней
+        wrapped = f"<root>{text}</root>"
+        tree = fromstring(wrapped, parser=parser)
+        
+        def clean_element(el):
+            if el.tag in ALLOWED_TAGS:
+                # Сохраняем тег
+                inner = "".join(clean_element(e) for e in el)
+                attrs = " ".join(f'{k}="{v}"' for k, v in el.attrib.items())
+                if attrs:
+                    return f"<{el.tag} {attrs}>{inner}</{el.tag}>"
+                else:
+                    return f"<{el.tag}>{inner}</{el.tag}>"
+            else:
+                # Убираем тег, оставляем только текст
+                return "".join(clean_element(e) for e in el) + (el.text or "") + (el.tail or "")
+
+        result = "".join(clean_element(e) for e in tree)
+        return result
+    except ParseError:
+        # Если не смогли распарсить — просто убираем все теги
+        return strip_tags(text)
+
 
 def sys_prompt(uid: int) -> str:
     subject = USER_SUBJECT[uid]
     grade = USER_GRADE[uid]
     parent = PARENT_MODE[uid]
 
+    # Поддержка белорусского языка
     if subject in ["беларуская мова", "беларуская літаратура"]:
         return (
             "Ты — ІІ-памочнік па беларускай мове і літаратуры. "
@@ -334,6 +382,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = raw_text.lower()
     state = USER_STATE[uid]
 
+    # Обработка выбора после фото
     if state == "AWAIT_TEXT_OR_PHOTO_CHOICE":
         if text == "📸 решить по фото":
             USER_STATE[uid] = None
@@ -344,6 +393,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             return await update.message.reply_text("Выбери: 'Решить по фото' или 'Напишу текстом'")
 
+    # Обработка уточнения
     if state == "AWAIT_FOLLOWUP":
         if text == "да":
             USER_STATE[uid] = "AWAIT_EXPLAIN"
@@ -354,6 +404,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             return await update.message.reply_text("Ответь: Да или Нет")
 
+    # Кнопки
     if text == "🧠 объяснить":
         return await explain_cmd(update, context)
     if text == "📝 сочинение":
@@ -364,23 +415,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb(uid),
         )
     if text.startswith("📚 предмет:"):
-        return await update.message.reply_text(
-            "Сменить: /subject <название|auto>",
-            reply_markup=kb(uid),
-        )
+        return await update.message.reply_text("Сменить: /subject <название|auto>", reply_markup=kb(uid))
     if text.startswith("🎓 класс:"):
-        return await update.message.reply_text(
-            "Сменить: /grade 5–11",
-            reply_markup=kb(uid),
-        )
+        return await update.message.reply_text("Сменить: /grade 5–11", reply_markup=kb(uid))
     if text.startswith("👨‍👩‍👧 родит.:"):
-        return await update.message.reply_text(
-            "Вкл/выкл: /parent on|off",
-            reply_markup=kb(uid),
-        )
+        return await update.message.reply_text("Вкл/выкл: /parent on|off", reply_markup=kb(uid))
     if text in {"📋 меню /menu", "ℹ️ помощь"}:
         return await help_cmd(update, context)
 
+    # Состояния
     if state == "AWAIT_EXPLAIN":
         USER_STATE[uid] = None
         context.args = [raw_text]
@@ -390,6 +433,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.args = [raw_text]
         return await essay_cmd(update, context)
 
+    # Любой текст = объяснить
     context.args = [raw_text]
     return await explain_cmd(update, context)
 
@@ -399,6 +443,7 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.post_init = set_commands
 
+    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -409,6 +454,7 @@ def main():
     app.add_handler(CommandHandler("essay", essay_cmd))
     app.add_handler(CommandHandler("explain", explain_cmd))
 
+    # Обработчики
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
