@@ -270,7 +270,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         out = await gpt_explain(uid, ocr_text)
         
         await update.message.reply_text(out[:4000], reply_markup=kb(uid), parse_mode="HTML", disable_web_page_preview=True)
-    except Exception as e:
+    except Exception:
         log.exception("photo")
         keyboard = ReplyKeyboardMarkup(
             [["📸 Решить по фото", "✍️ Напишу текстом"]],
@@ -312,13 +312,32 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await update.message.reply_text("Ответь: Да или Нет")
 
     # Кнопки
-    if text == "🧠 объяснить":           return await explain_cmd(update, context)
-    if text == "📝 сочинение":           return await essay_cmd(update, context)
-    if text == "📸 фото задания":        return await update.message.reply_text("Отправь фото сообщением — я распознаю и объясню.", reply_markup=kb(uid))
-    if text.startswith("📚 предмет:"):   return await update.message.reply_text("Сменить: /subject <название|auto>", reply_markup=kb(uid))
-    if text.startswith("🎓 класс:"):     return await update.message.reply_text("Сменить: /grade 5–11", reply_markup=kb(uid))
-    if text.startswith("👨‍👩‍👧 родит.:"): return await update.message.reply_text("Вкл/выкл: /parent on|off", reply_markup=kb(uid))
-    if text in {"📋 меню /menu", "ℹ️ помощь"}: return await help_cmd(update, context)
+    if text == "🧠 объяснить":
+        return await explain_cmd(update, context)
+    if text == "📝 сочинение":
+        return await essay_cmd(update, context)
+    if text == "📸 фото задания":
+        return await update.message.reply_text(
+            "Отправь фото сообщением — я распознаю и объясню.",
+            reply_markup=kb(uid),
+        )
+    if text.startswith("📚 предмет:"):
+        return await update.message.reply_text(
+            "Сменить: /subject <название|auto>",
+            reply_markup=kb(uid),
+        )
+    if text.startswith("🎓 класс:"):
+        return await update.message.reply_text(
+            "Сменить: /grade 5–11",
+            reply_markup=kb(uid),
+        )
+    if text.startswith("👨‍👩‍👧 родит.:"):
+        return await update.message.reply_text(
+            "Вкл/выкл: /parent on|off",
+            reply_markup=kb(uid),
+        )
+    if text in {"📋 меню /menu", "ℹ️ помощь"}:
+        return await help_cmd(update, context)
 
     # Состояния
     if state == "AWAIT_EXPLAIN":
