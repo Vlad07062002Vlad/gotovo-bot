@@ -10,7 +10,7 @@ from collections import defaultdict
 from telegram import Update, BotCommand, ReplyKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.error import BadRequest
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters as f
 from openai import AsyncOpenAI
 
 from PIL import Image, ImageOps, ImageFilter, ImageEnhance
