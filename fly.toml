@@ -2,7 +2,7 @@ app = "gotovo-bot"
 primary_region = "waw"
 
 [env]
-  TESS_LANGС = "bel+rus+eng"   # можно удалить — уже есть в Dockerfile
+#  TESS_LANGС = "bel+rus+eng"   # можно удалить — уже есть в Dockerfile
   TESS_CONFIG = "--oem 3 --psm 6 -c preserve_interword_spaces=1"
 
 [http_service]
