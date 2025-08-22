@@ -4,6 +4,7 @@ import re
 import html
 import logging
 import threading
+import asyncio
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import defaultdict
 
@@ -73,7 +74,6 @@ def kb(uid: int) -> ReplyKeyboardMarkup:
 
 # ---------- НАДЁЖНАЯ ОЧИСТКА HTML ----------
 ALLOWED_TAGS = {"b", "i", "code", "pre"}  # <a> исключаем, чтобы не ловить Telegram-ошибки
-# важно: ищем экранированные теги в уже-экранированном тексте
 _TAG_OPEN = {t: f"&lt;{t}&gt;" for t in ALLOWED_TAGS}
 _TAG_CLOSE = {t: f"&lt;/{t}&gt;" for t in ALLOWED_TAGS}
 
@@ -110,6 +110,51 @@ async def safe_reply_html(message, text: str, **kwargs):
                 **kwargs
             )
         raise
+
+# ---------- ВИДИМОЕ ОЖИДАНИЕ («часики») ----------
+async def start_spinner(update: Update, context: ContextTypes.DEFAULT_TYPE, label: str = "Обрабатываю…", interval: float = 1.8):
+    """
+    Показывает «крутилку» как редактируемое сообщение: ⏳/⌛/🕒 + label.
+    Возвращает (finish, set_label):
+      - await finish(final_text=None, delete=True) — остановить, опционально показать финальный текст и удалить сообщение
+      - set_label(new_label) — сменить подпись на лету
+    """
+    msg = await update.message.reply_text(f"⏳ {label}")
+    stop = asyncio.Event()
+    current_label = label
+
+    def set_label(new_label: str):
+        nonlocal current_label
+        current_label = new_label
+
+    async def worker():
+        frames = ["⏳", "⌛", "🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚", "🕛"]
+        i = 0
+        while not stop.is_set():
+            i = (i + 1) % len(frames)
+            try:
+                await msg.edit_text(f"{frames[i]} {current_label}")
+            except Exception:
+                pass
+            await asyncio.sleep(interval)
+
+    task = asyncio.create_task(worker())
+
+    async def finish(final_text: str = None, delete: bool = True):
+        stop.set()
+        try:
+            await task
+        except Exception:
+            pass
+        try:
+            if final_text:
+                await msg.edit_text(final_text)
+            if delete:
+                await msg.delete()
+        except Exception:
+            pass
+
+    return finish, set_label
 
 # ---------- ЯЗЫК ВВОДА ----------
 def detect_lang(text: str) -> str:
@@ -180,7 +225,6 @@ async def classify_subject(text: str) -> str:
             max_tokens=10,
         )
         ans = (resp.choices[0].message.content or "").strip().lower()
-        # нормализация пары популярных вариантов
         mapping = {
             "беларуская мова": "беларуская мова",
             "беларуская літаратура": "беларуская літаратура",
@@ -197,11 +241,9 @@ async def classify_subject(text: str) -> str:
             "английский": "английский",
             "auto": "auto",
         }
-        # приведение к известным ключам
         for k, v in mapping.items():
             if ans == k:
                 return v if v in SUBJECTS else "auto"
-        # иногда модель может ответить «русский» — это ок
         return ans if ans in SUBJECTS else "auto"
     except Exception as e:
         log.warning(f"classify_subject failed: {e}")
@@ -209,17 +251,12 @@ async def classify_subject(text: str) -> str:
 
 # ---------- OCR: препроцесс и каскад языков ----------
 def _preprocess_image(img: Image.Image) -> Image.Image:
-    # автоповорот по EXIF
     img = ImageOps.exif_transpose(img)
-    # к ч/б + автоконтраст
     img = img.convert("L")
     img = ImageOps.autocontrast(img)
-    # шумоподавление/резкость
     img = img.filter(ImageFilter.MedianFilter(size=3))
     img = ImageEnhance.Sharpness(img).enhance(1.25)
-    # лёгкий UnsharpMask для мелкого шрифта
     img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=125, threshold=3))
-    # апскейл для мелкого текста
     max_w = 1800
     if img.width < max_w:
         scale = min(max_w / img.width, 3.0)
@@ -227,7 +264,6 @@ def _preprocess_image(img: Image.Image) -> Image.Image:
     return img
 
 def _ocr_with_langs(img: Image.Image, langs_list) -> str:
-    """Пробуем языки по очереди, пока не получится что-то осмысленное."""
     for langs in langs_list:
         try:
             txt = pytesseract.image_to_string(img, lang=langs, config=TESS_CONFIG)
@@ -240,10 +276,7 @@ def _ocr_with_langs(img: Image.Image, langs_list) -> str:
     return ""
 
 def ocr_image(img: Image.Image) -> str:
-    # базовый поворот по EXIF
     base = ImageOps.exif_transpose(img)
-
-    # цепочка языков: env → rus+bel+eng+deu+fra → rus+eng → rus → bel → deu → fra → eng
     langs_chain = []
     if TESS_LANGS:
         langs_chain.append(TESS_LANGS)
@@ -251,7 +284,6 @@ def ocr_image(img: Image.Image) -> str:
         if l not in langs_chain:
             langs_chain.append(l)
 
-    # пробуем определить угол через OSD (если доступно)
     angles = []
     try:
         osd = pytesseract.image_to_osd(base, config="--psm 0")
@@ -261,21 +293,19 @@ def ocr_image(img: Image.Image) -> str:
     except TesseractError as e:
         log.warning(f"OSD failed: {e}")
 
-    # всегда перебираем 0/90/180/270, начиная с угла из OSD (если был)
     tried = set()
     for a in angles + [0, 90, 180, 270]:
         a %= 360
         if a in tried:
             continue
         tried.add(a)
-        rot = base.rotate(-a, expand=True)        # поворачиваем «в ноль»
-        pimg = _preprocess_image(rot)             # препроцесс
-        txt = _ocr_with_langs(pimg, langs_chain)  # каскад языков
+        rot = base.rotate(-a, expand=True)
+        pimg = _preprocess_image(rot)
+        txt = _ocr_with_langs(pimg, langs_chain)
         if txt and txt.strip():
             log.info(f"OCR best_angle={a} len={len(txt)}")
             return txt.strip()
 
-    # последний шанс — без препроцесса на оставшихся углах
     for a in (0, 90, 180, 270):
         if a in tried:
             continue
@@ -376,12 +406,10 @@ def _answers_hint(task_lang: str) -> str:
 
 async def gpt_explain(uid: int, prompt: str, prepend_prompt: bool = True) -> str:
     log.info(f"EXPLAIN/SOLVE uid={uid} subj={USER_SUBJECT[uid]} grade={USER_GRADE[uid]} text={prompt[:80]!r}")
-    # определяем язык входа (для языка «Ответов»)
     lang = detect_lang(prompt)
     USER_LANG[uid] = lang
 
     if USER_SUBJECT[uid] == "auto":
-        # пробуем классифицировать предмет
         subj = await classify_subject(prompt)
         if subj in SUBJECTS:
             USER_SUBJECT[uid] = subj
@@ -401,8 +429,6 @@ async def gpt_explain(uid: int, prompt: str, prepend_prompt: bool = True) -> str
             f"Текст/условие:\n{prompt}"
         )
 
-    # индикация «печатает» во время ответа
-    # (вызов сам по себе быстрый, но это приятная анимация)
     messages = [
         {"role": "system", "content": sys_prompt(uid)},
         {"role": "user", "content": user_content}
@@ -436,13 +462,15 @@ async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         USER_STATE[uid] = "AWAIT_EXPLAIN"
         return await update.message.reply_text("🧠 Что объяснить/решить? Напиши одной фразой.", reply_markup=kb(uid))
+    spinner_finish, spinner_set = await start_spinner(update, context, "Думаю над решением…")
     try:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+        spinner_set("Определяю предмет…")
         if USER_SUBJECT[uid] == "auto":
-            # параллельно «показываем» анимацию
             subj = await classify_subject(text)
             if subj in SUBJECTS:
                 USER_SUBJECT[uid] = subj
+        spinner_set("Решаю задачу…")
         out = await gpt_explain(uid, text)
         await safe_reply_html(update.message, out, reply_markup=kb(uid))
         keyboard = ReplyKeyboardMarkup([["Да", "Нет"]], resize_keyboard=True, one_time_keyboard=True)
@@ -451,6 +479,8 @@ async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception("explain")
         await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=kb(uid))
+    finally:
+        await spinner_finish()
 
 async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -458,24 +488,26 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not topic:
         USER_STATE[uid] = "AWAIT_ESSAY"
         return await update.message.reply_text("📝 Тема сочинения?", reply_markup=kb(uid))
+    spinner_finish, spinner_set = await start_spinner(update, context, "Готовлю сочинение…")
     try:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+        spinner_set("Пишу основной текст…")
         essay = await gpt_essay(uid, topic)
         await safe_reply_html(update.message, essay, reply_markup=kb(uid))
 
+        spinner_set("Делаю план…")
         plan_prompt = (
             f"Составь нумерованный план сочинения на тему '{topic}'. "
             "Каждый пункт короткий. Используй только HTML-теги <b>, <i>, <code>, <pre>."
         )
-        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         plan = await gpt_explain(uid, plan_prompt, prepend_prompt=False)
         await safe_reply_html(update.message, plan, reply_markup=kb(uid))
 
+        spinner_set("Поясняю логику…")
         reason_prompt = (
             f"Кратко объясни, почему для сочинения на тему '{topic}' выбран такой план. "
             "Ответ должен использовать только HTML-теги <b>, <i>, <code>, <pre>."
         )
-        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         reason = await gpt_explain(uid, reason_prompt, prepend_prompt=False)
         await safe_reply_html(update.message, reason, reply_markup=kb(uid))
 
@@ -485,11 +517,13 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception("essay")
         await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=kb(uid))
+    finally:
+        await spinner_finish()
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    spinner_finish, spinner_set = await start_spinner(update, context, "Обрабатываю фото…")
     try:
-        # анимация ожидания: загружаем фото
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
 
         # Берём картинку как из photo, так и из document (если это image/*)
@@ -504,7 +538,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = await tg_file.download_as_bytearray()
         img = Image.open(io.BytesIO(data))
 
-        # анимация ожидания: идёт распознавание
+        spinner_set("Распознаю текст на фото…")
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         ocr_text = ocr_image(img)
         log.info(f"OCR uid={uid} text={ocr_text!r}")
@@ -512,18 +546,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not ocr_text or not ocr_text.strip():
             raise ValueError("OCR returned empty text")
 
-        # автоопределение языка по фото (для языка «Ответов»)
         USER_LANG[uid] = detect_lang(ocr_text)
 
-        # автоматическая классификация предмета по фото
         if USER_SUBJECT[uid] == "auto":
-            await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+            spinner_set("Определяю предмет…")
             subj = await classify_subject(ocr_text)
             if subj in SUBJECTS:
                 USER_SUBJECT[uid] = subj
                 log.info(f"Subject from photo: {subj}")
 
-        # решаем
+        spinner_set("Решаю задание…")
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         out = await gpt_explain(uid, ocr_text[:4000])
         await safe_reply_html(update.message, out, reply_markup=kb(uid))
@@ -540,6 +572,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=keyboard
         )
         USER_STATE[uid] = "AWAIT_TEXT_OR_PHOTO_CHOICE"
+    finally:
+        await spinner_finish()
 
 # ---------- Текст и кнопки ----------
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -548,14 +582,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = raw_text.lower()
     state = USER_STATE[uid]
 
-    # анимация ожидания
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
 
-    # Авто-детект языка для обычного текста (для языка «Ответов»)
     if raw_text:
         USER_LANG[uid] = detect_lang(raw_text)
 
-    # Обработка выбора после фото
     if state == "AWAIT_TEXT_OR_PHOTO_CHOICE":
         if text == "📸 решить по фото":
             USER_STATE[uid] = None
@@ -566,7 +597,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             return await update.message.reply_text("Выбери: 'Решить по фото' или 'Напишу текстом'")
 
-    # Обработка уточнения
     if state == "AWAIT_FOLLOWUP":
         if text == "да":
             USER_STATE[uid] = "AWAIT_EXPLAIN"
@@ -577,7 +607,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             return await update.message.reply_text("Ответь: Да или Нет")
 
-    # Кнопки
     if text == "🧠 объяснить":
         return await explain_cmd(update, context)
     if text == "📝 сочинение":
@@ -596,7 +625,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in {"📋 меню /menu", "ℹ️ помощь"}:
         return await help_cmd(update, context)
 
-    # Состояния
     if state == "AWAIT_EXPLAIN":
         USER_STATE[uid] = None
         context.args = [raw_text]
@@ -606,7 +634,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.args = [raw_text]
         return await essay_cmd(update, context)
 
-    # Любой текст = решить/объяснить
     context.args = [raw_text]
     return await explain_cmd(update, context)
 
@@ -616,7 +643,6 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.post_init = set_commands
 
-    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -627,7 +653,6 @@ def main():
     app.add_handler(CommandHandler("essay", essay_cmd))
     app.add_handler(CommandHandler("explain", explain_cmd))
 
-    # Обработчики
     app.add_handler(MessageHandler(f.PHOTO | f.Document.IMAGE, handle_photo))
     app.add_handler(MessageHandler(f.TEXT & ~f.COMMAND, on_text))
 
