@@ -187,26 +187,53 @@ def _ocr_with_langs(img: Image.Image, langs_list) -> str:
     return ""
 
 def ocr_image(img: Image.Image) -> str:
-    pimg = _preprocess_image(img)
-    # основной порядок: env → bel+rus+eng → rus+eng → rus → eng
+    # базовый поворот по EXIF
+    base = ImageOps.exif_transpose(img)
+
+    # цепочка языков: env → bel+rus+eng → rus+eng → rus → eng
     langs_chain = []
     if TESS_LANGS:
         langs_chain.append(TESS_LANGS)
-    for l in ["bel+rus+eng", "rus+eng", "rus", "eng"]:
+    for l in ("bel+rus+eng", "rus+eng", "rus", "eng"):
         if l not in langs_chain:
             langs_chain.append(l)
-    text = _ocr_with_langs(pimg, langs_chain)
-    if not text:
-        # последний шанс — без препроцесса
-        text = _ocr_with_langs(img, ["rus+eng", "rus", "eng"])
-    return text or ""
 
-# Показать доступные языки в логах (если доступно)
-try:
-    avail_langs = pytesseract.get_languages(config="")
-    log.info(f"Tesseract languages available: {avail_langs}")
-except Exception as _:
-    pass
+    # пробуем определить угол через OSD (если доступно)
+    angles = []
+    try:
+        osd = pytesseract.image_to_osd(base, config="--psm 0")
+        m = re.search(r"(?:Rotate|Orientation in degrees):\s*(\d+)", osd)
+        if m:
+            angles.append(int(m.group(1)) % 360)
+    except TesseractError as e:
+        log.warning(f"OSD failed: {e}")
+
+    # всегда перебираем 0/90/180/270, начиная с угла из OSD (если был)
+    tried = set()
+    for a in angles + [0, 90, 180, 270]:
+        a %= 360
+        if a in tried:
+            continue
+        tried.add(a)
+        rot = base.rotate(-a, expand=True)        # поворачиваем «в ноль»
+        pimg = _preprocess_image(rot)             # препроцесс
+        txt = _ocr_with_langs(pimg, langs_chain)  # каскад языков
+        if txt and txt.strip():
+            log.info(f"OCR best_angle={a} len={len(txt)}")
+            return txt.strip()
+
+    # последний шанс — без препроцесса на оставшихся углах
+    for a in (0, 90, 180, 270):
+        if a in tried:
+            continue
+        rot = base.rotate(-a, expand=True)
+        txt = _ocr_with_langs(rot, ["rus+eng", "rus", "eng"])
+        if txt and txt.strip():
+            log.info(f"OCR fallback_angle={a} len={len(txt)}")
+            return txt.strip()
+
+    return ""
+
 
 # ---------- КОМАНДЫ ----------
 async def set_commands(app: Application):
