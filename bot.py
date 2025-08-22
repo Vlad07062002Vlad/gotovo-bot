@@ -33,7 +33,7 @@ PORT = int(os.getenv("PORT", "8080"))
 
 # Путь/период автосейва метрик
 DATA_DIR = os.getenv("DATA_DIR", "/data")
-METRICS_PATH = os.getenv("METRICS_PATH", os.path.join(DATA_DIR, "metrics.json"))
+METRICS_PATH = os.path.join(DATA_DIR, "metrics.json")
 METRICS_AUTOSAVE_SEC = int(os.getenv("METRICS_AUTOSAVE_SEC", "60"))
 
 # OCR конфиги/языки (можно переопределить в env)
@@ -77,7 +77,7 @@ class UserStats:
         self.ocr_fail = 0
         self.bytes_images_in = 0
 
-USERS = {}  # uid -> UserStats
+USERS: dict[int, UserStats] = {}  # uid -> UserStats
 
 def _get_user_stats(uid: int, update: Update | None = None) -> UserStats:
     with STATS_LOCK:
