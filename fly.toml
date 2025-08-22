@@ -1,3 +1,4 @@
+# fly.toml
 app = "gotovo-bot"
 primary_region = "waw"
 
@@ -20,7 +21,8 @@ primary_region = "waw"
   cpus = 1
   memory = "1gb"
 
-# Персистентный том для метрик (/data/metrics.json)
+# маунт для process-group 'app'
 [[mounts]]
   source = "data"
   destination = "/data"
+  processes = ["app"]
