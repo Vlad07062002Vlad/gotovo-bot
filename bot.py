@@ -366,7 +366,7 @@ async def gpt_essay(uid: int, topic: str) -> str:
             {"role": "user", "content": f"Напиши сочинение. Тема: {topic}"}
         ],
         temperature=0.7,
-        max_tokens=700
+        max_tokens=1200
     )
     return resp.choices[0].message.content.strip()
 
@@ -424,14 +424,24 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     try:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-        file = await update.message.photo[-1].get_file()
-        data = await file.download_as_bytearray()
+
+        # Берём картинку как из photo, так и из document (если это image/*)
+        tg_file = None
+        if update.message.photo:
+            tg_file = await update.message.photo[-1].get_file()
+        elif update.message.document and str(update.message.document.mime_type or "").startswith("image/"):
+            tg_file = await update.message.document.get_file()
+        else:
+            raise ValueError("No image provided")
+
+        data = await tg_file.download_as_bytearray()
         img = Image.open(io.BytesIO(data))
 
+        # OCR
         ocr_text = ocr_image(img)
         log.info(f"OCR uid={uid} text={ocr_text!r}")
 
-        if not ocr_text:
+        if not ocr_text or not ocr_text.strip():
             raise ValueError("OCR returned empty text")
 
         # автоопределение языка по фото
@@ -440,6 +450,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ocr_text = ocr_text[:4000]  # ограничение длины
         out = await gpt_explain(uid, ocr_text)
         await safe_reply_html(update.message, out, reply_markup=kb(uid))
+
     except Exception:
         log.exception("photo")
         keyboard = ReplyKeyboardMarkup(
@@ -448,10 +459,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             one_time_keyboard=True
         )
         await update.message.reply_text(
-            "Не удалось обработать фото. Попробуй ещё раз или введи текстом:",
+            "Не удалось обработать изображение. Попробуй ещё раз или введи текстом:",
             reply_markup=keyboard
         )
         USER_STATE[uid] = "AWAIT_TEXT_OR_PHOTO_CHOICE"
+
 
 # ---------- Текст и кнопки ----------
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -537,8 +549,8 @@ def main():
     app.add_handler(CommandHandler("explain", explain_cmd))
 
     # Обработчики
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(f.PHOTO | f.Document.IMAGE, handle_photo))
+    app.add_handler(MessageHandler(f.TEXT & ~f.COMMAND, on_text))
 
     log.info("Gotovo bot is running…")
     app.run_polling(drop_pending_updates=True)
