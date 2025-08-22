@@ -2,11 +2,15 @@ import os
 import io
 import re
 import html
+import json
+import time
+import tempfile
 import logging
 import threading
 import asyncio
+from time import perf_counter
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 from telegram import Update, BotCommand, ReplyKeyboardMarkup
 from telegram.constants import ChatAction
@@ -27,6 +31,11 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PORT = int(os.getenv("PORT", "8080"))
 
+# Путь/период автосейва метрик
+DATA_DIR = os.getenv("DATA_DIR", "/data")
+METRICS_PATH = os.getenv("METRICS_PATH", os.path.join(DATA_DIR, "metrics.json"))
+METRICS_AUTOSAVE_SEC = int(os.getenv("METRICS_AUTOSAVE_SEC", "60"))
+
 # OCR конфиги/языки (можно переопределить в env)
 TESS_LANGS_DEFAULT = "rus+bel+eng+deu+fra"
 TESS_LANGS = os.getenv("TESS_LANGS", TESS_LANGS_DEFAULT)
@@ -39,12 +48,196 @@ if not OPENAI_API_KEY:
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
+# ---------- СТАТИСТИКА ----------
+STATS_LOCK = threading.RLock()
+
+class UserStats:
+    __slots__ = (
+        "uid", "name", "username",
+        "first_seen", "last_seen",
+        "kinds", "subjects", "langs",
+        "gpt_calls", "gpt_time_sum", "tok_prompt", "tok_completion",
+        "ocr_ok", "ocr_fail", "bytes_images_in",
+    )
+    def __init__(self, uid: int):
+        self.uid = uid
+        self.name = ""
+        self.username = ""
+        now = time.time()
+        self.first_seen = now
+        self.last_seen = now
+        self.kinds = Counter()       # text_msg/photo_msg/solve_text/solve_photo/essay
+        self.subjects = Counter()    # предметы
+        self.langs = Counter()       # ru/be/en/de/fr
+        self.gpt_calls = 0
+        self.gpt_time_sum = 0.0
+        self.tok_prompt = 0
+        self.tok_completion = 0
+        self.ocr_ok = 0
+        self.ocr_fail = 0
+        self.bytes_images_in = 0
+
+USERS = {}  # uid -> UserStats
+
+def _get_user_stats(uid: int, update: Update | None = None) -> UserStats:
+    with STATS_LOCK:
+        st = USERS.get(uid)
+        if not st:
+            st = UserStats(uid)
+            USERS[uid] = st
+        st.last_seen = time.time()
+        if update and update.effective_user:
+            st.name = update.effective_user.full_name or st.name
+            st.username = update.effective_user.username or st.username
+        return st
+
+def stats_snapshot() -> dict:
+    with STATS_LOCK:
+        snap_users = {}
+        totals = {
+            "users_count": 0,
+            "tasks_total": 0,
+            "solve_text": 0,
+            "solve_photo": 0,
+            "essay": 0,
+            "text_msg": 0,
+            "photo_msg": 0,
+            "ocr_ok": 0,
+            "ocr_fail": 0,
+            "gpt_calls": 0,
+            "gpt_time_sum": 0.0,
+            "tok_prompt": 0,
+            "tok_completion": 0,
+            "bytes_images_in": 0,
+            "subjects": {},
+            "langs": {},
+        }
+        subjects_acc = Counter()
+        langs_acc = Counter()
+
+        for uid, st in USERS.items():
+            u = {
+                "name": st.name,
+                "username": st.username,
+                "first_seen": st.first_seen,
+                "last_seen": st.last_seen,
+                "kinds": dict(st.kinds),
+                "subjects": dict(st.subjects),
+                "langs": dict(st.langs),
+                "gpt_calls": st.gpt_calls,
+                "gpt_time_sum": st.gpt_time_sum,
+                "tok_prompt": st.tok_prompt,
+                "tok_completion": st.tok_completion,
+                "ocr_ok": st.ocr_ok,
+                "ocr_fail": st.ocr_fail,
+                "bytes_images_in": st.bytes_images_in,
+            }
+            snap_users[str(uid)] = u
+
+            totals["users_count"] += 1
+            totals["solve_text"] += u["kinds"].get("solve_text", 0)
+            totals["solve_photo"] += u["kinds"].get("solve_photo", 0)
+            totals["essay"] += u["kinds"].get("essay", 0)
+            totals["text_msg"] += u["kinds"].get("text_msg", 0)
+            totals["photo_msg"] += u["kinds"].get("photo_msg", 0)
+            totals["ocr_ok"] += u["ocr_ok"]
+            totals["ocr_fail"] += u["ocr_fail"]
+            totals["gpt_calls"] += u["gpt_calls"]
+            totals["gpt_time_sum"] += u["gpt_time_sum"]
+            totals["tok_prompt"] += u["tok_prompt"]
+            totals["tok_completion"] += u["tok_completion"]
+            totals["bytes_images_in"] += u["bytes_images_in"]
+            subjects_acc.update(u["subjects"])
+            langs_acc.update(u["langs"])
+
+        totals["tasks_total"] = totals["solve_text"] + totals["solve_photo"] + totals["essay"]
+        totals["subjects"] = dict(subjects_acc)
+        totals["langs"] = dict(langs_acc)
+
+        return {
+            "generated_at": int(time.time()),
+            "users": snap_users,
+            "totals": totals,
+        }
+
+def stats_save(path: str = METRICS_PATH):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    snap = stats_snapshot()
+    data = json.dumps(snap, ensure_ascii=False, indent=2).encode("utf-8")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".metrics.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+def stats_load(path: str = METRICS_PATH):
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            snap = json.load(f)
+        users = snap.get("users", {})
+        with STATS_LOCK:
+            for uid_s, u in users.items():
+                uid = int(uid_s)
+                st = USERS.get(uid) or UserStats(uid)
+                st.name = u.get("name") or st.name
+                st.username = u.get("username") or st.username
+                st.first_seen = u.get("first_seen", st.first_seen)
+                st.last_seen = u.get("last_seen", st.last_seen)
+                st.kinds = Counter(u.get("kinds", {}))
+                st.subjects = Counter(u.get("subjects", {}))
+                st.langs = Counter(u.get("langs", {}))
+                st.gpt_calls = u.get("gpt_calls", 0)
+                st.gpt_time_sum = u.get("gpt_time_sum", 0.0)
+                st.tok_prompt = u.get("tok_prompt", 0)
+                st.tok_completion = u.get("tok_completion", 0)
+                st.ocr_ok = u.get("ocr_ok", 0)
+                st.ocr_fail = u.get("ocr_fail", 0)
+                st.bytes_images_in = u.get("bytes_images_in", 0)
+                USERS[uid] = st
+        log.info(f"Loaded metrics from {path} (users={len(USERS)})")
+    except Exception as e:
+        log.warning(f"stats_load failed: {e}")
+
+def _stats_autosave_loop():
+    interval = max(10, METRICS_AUTOSAVE_SEC)
+    log.info(f"Metrics autosave: every {interval}s -> {METRICS_PATH}")
+    while True:
+        try:
+            stats_save()
+        except Exception as e:
+            log.warning(f"stats_save failed: {e}")
+        time.sleep(interval)
+
 # ---------- Health-check для Fly ----------
 class _Health(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"ok")
+        try:
+            if self.path == "/stats.json":
+                payload = json.dumps(stats_snapshot(), ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+        except Exception as e:
+            body = f"error: {e}".encode("utf-8")
+            self.send_response(500)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
 def _run_health():
     HTTPServer(("0.0.0.0", PORT), _Health).serve_forever()
@@ -115,9 +308,7 @@ async def safe_reply_html(message, text: str, **kwargs):
 async def start_spinner(update: Update, context: ContextTypes.DEFAULT_TYPE, label: str = "Обрабатываю…", interval: float = 1.8):
     """
     Показывает «крутилку» как редактируемое сообщение: ⏳/⌛/🕒 + label.
-    Возвращает (finish, set_label):
-      - await finish(final_text=None, delete=True) — остановить, опционально показать финальный текст и удалить сообщение
-      - set_label(new_label) — сменить подпись на лету
+    Возвращает (finish, set_label).
     """
     msg = await update.message.reply_text(f"⏳ {label}")
     stop = asyncio.Event()
@@ -333,6 +524,7 @@ async def set_commands(app: Application):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    _get_user_stats(uid, update)  # touch
     await safe_reply_html(
         update.message,
         "👋 Привет! Я — <b>Готово!</b> Помогаю понять ДЗ.\n"
@@ -375,6 +567,9 @@ async def subject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if val not in SUBJECTS:
         return await update.message.reply_text("Не понял предмет. Доступно: " + ", ".join(sorted(SUBJECTS)), reply_markup=kb(uid))
     USER_SUBJECT[uid] = val
+    st = _get_user_stats(uid, update)
+    with STATS_LOCK:
+        st.subjects[val] += 1  # зафиксируем выбор руками
     await update.message.reply_text(f"Предмет: {val}", reply_markup=kb(uid))
 
 async def grade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -433,17 +628,34 @@ async def gpt_explain(uid: int, prompt: str, prepend_prompt: bool = True) -> str
         {"role": "system", "content": sys_prompt(uid)},
         {"role": "user", "content": user_content}
     ]
+
+    t0 = perf_counter()
     resp = await client.chat.completions.create(
         model="gpt-4o",
         messages=messages,
         temperature=0.2,
         max_tokens=1000
     )
+    dt = perf_counter() - t0
+
+    # учёт метрик
+    st = _get_user_stats(uid, None)
+    with STATS_LOCK:
+        st.gpt_calls += 1
+        st.gpt_time_sum += dt
+        usage = getattr(resp, "usage", None)
+        if usage:
+            st.tok_prompt += getattr(usage, "prompt_tokens", 0) or 0
+            st.tok_completion += getattr(usage, "completion_tokens", 0) or 0
+        st.subjects[USER_SUBJECT[uid]] += 1
+        st.langs[lang] += 1
+
     return (resp.choices[0].message.content or "").strip()
 
 async def gpt_essay(uid: int, topic: str) -> str:
     log.info(f"ESSAY uid={uid} topic={topic[:80]!r}")
     USER_LANG[uid] = detect_lang(topic)
+    t0 = perf_counter()
     resp = await client.chat.completions.create(
         model="gpt-4o",
         messages=[
@@ -453,17 +665,30 @@ async def gpt_essay(uid: int, topic: str) -> str:
         temperature=0.7,
         max_tokens=1200
     )
+    dt = perf_counter() - t0
+    st = _get_user_stats(uid, None)
+    with STATS_LOCK:
+        st.gpt_calls += 1
+        st.gpt_time_sum += dt
+        usage = getattr(resp, "usage", None)
+        if usage:
+            st.tok_prompt += getattr(usage, "prompt_tokens", 0) or 0
+            st.tok_completion += getattr(usage, "completion_tokens", 0) or 0
+        st.kinds["essay"] += 1
     return (resp.choices[0].message.content or "").strip()
 
 # ---------- Обработчики ----------
 async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    st = _get_user_stats(uid, update)
     text = " ".join(context.args).strip()
     if not text:
         USER_STATE[uid] = "AWAIT_EXPLAIN"
         return await update.message.reply_text("🧠 Что объяснить/решить? Напиши одной фразой.", reply_markup=kb(uid))
     spinner_finish, spinner_set = await start_spinner(update, context, "Думаю над решением…")
     try:
+        with STATS_LOCK:
+            st.kinds["text_msg"] += 1
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         spinner_set("Определяю предмет…")
         if USER_SUBJECT[uid] == "auto":
@@ -472,6 +697,8 @@ async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 USER_SUBJECT[uid] = subj
         spinner_set("Решаю задачу…")
         out = await gpt_explain(uid, text)
+        with STATS_LOCK:
+            st.kinds["solve_text"] += 1
         await safe_reply_html(update.message, out, reply_markup=kb(uid))
         keyboard = ReplyKeyboardMarkup([["Да", "Нет"]], resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("Нужно что-то уточнить по решению?", reply_markup=keyboard)
@@ -484,6 +711,7 @@ async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    st = _get_user_stats(uid, update)
     topic = " ".join(context.args).strip()
     if not topic:
         USER_STATE[uid] = "AWAIT_ESSAY"
@@ -522,6 +750,7 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    st = _get_user_stats(uid, update)
     spinner_finish, spinner_set = await start_spinner(update, context, "Обрабатываю фото…")
     try:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
@@ -536,6 +765,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise ValueError("No image provided")
 
         data = await tg_file.download_as_bytearray()
+        size_guess = getattr(tg_file, "file_size", None) or len(data)
+        with STATS_LOCK:
+            st.kinds["photo_msg"] += 1
+            st.bytes_images_in += int(size_guess)
+
         img = Image.open(io.BytesIO(data))
 
         spinner_set("Распознаю текст на фото…")
@@ -544,7 +778,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.info(f"OCR uid={uid} text={ocr_text!r}")
 
         if not ocr_text or not ocr_text.strip():
+            with STATS_LOCK:
+                st.ocr_fail += 1
             raise ValueError("OCR returned empty text")
+
+        with STATS_LOCK:
+            st.ocr_ok += 1
 
         USER_LANG[uid] = detect_lang(ocr_text)
 
@@ -558,6 +797,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         spinner_set("Решаю задание…")
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         out = await gpt_explain(uid, ocr_text[:4000])
+        with STATS_LOCK:
+            st.kinds["solve_photo"] += 1
         await safe_reply_html(update.message, out, reply_markup=kb(uid))
 
     except Exception:
@@ -578,9 +819,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- Текст и кнопки ----------
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    st = _get_user_stats(uid, update)
     raw_text = (update.message.text or "").strip()
     text = raw_text.lower()
     state = USER_STATE[uid]
+
+    with STATS_LOCK:
+        st.kinds["text_msg"] += 1
 
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
 
@@ -639,10 +884,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- MAIN ----------
 def main():
+    # загрузим накопленные метрики, если файл уже был
+    try:
+        stats_load()
+    except Exception as e:
+        log.warning(f"stats_load on boot failed: {e}")
+
+    # health + автосейв
     threading.Thread(target=_run_health, daemon=True).start()
+    threading.Thread(target=_stats_autosave_loop, daemon=True).start()
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.post_init = set_commands
 
+    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -653,6 +908,7 @@ def main():
     app.add_handler(CommandHandler("essay", essay_cmd))
     app.add_handler(CommandHandler("explain", explain_cmd))
 
+    # Обработчики
     app.add_handler(MessageHandler(f.PHOTO | f.Document.IMAGE, handle_photo))
     app.add_handler(MessageHandler(f.TEXT & ~f.COMMAND, on_text))
 
