@@ -1,29 +1,27 @@
-# --- минимальный образ, без Paketo/GCR ---
-FROM python:3.11-slim
+app = "gotovo-bot"
+primary_region = "waw"
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PORT=8080 \
-    TESSDATA_PREFIX=/usr/share/tesseract-ocr/4.00/tessdata \
-    TESS_LANGS=bel+rus+eng \
-    TESS_CONFIG="--oem 3 --psm 6 -c preserve_interword_spaces=1"
+[env]
+  TESS_LANGS = "bel+rus+eng"
+  TESS_CONFIG = "--oem 3 --psm 6 -c preserve_interword_spaces=1"
 
-WORKDIR /app
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"   # не гасим
+  auto_start_machines = true
+  min_machines_running = 1     # если «не останавливать», держим хотя бы 1
 
-# Системные deps + Tesseract с языками RU/BE и OSD (для авто-поворота)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    tesseract-ocr tesseract-ocr-rus tesseract-ocr-bel tesseract-ocr-osd \
-    libglib2.0-0 libsm6 libxext6 libxrender1 \
- && rm -rf /var/lib/apt/lists/*
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "10s"
+    grace_period = "5s"
+    method = "GET"
+    path = "/"
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Кладём код
-COPY . .
-
-EXPOSE 8080
-# Стартуем бота
-CMD ["python", "bot.py"]
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "1gb"
 
 
