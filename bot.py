@@ -12,8 +12,10 @@ from telegram.constants import ChatAction
 from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from openai import AsyncOpenAI
-from PIL import Image
+
+from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 import pytesseract
+from pytesseract import TesseractError
 
 # ---------- ЛОГИ ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -23,6 +25,11 @@ log = logging.getLogger("gotovo-bot")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PORT = int(os.getenv("PORT", "8080"))
+
+# OCR конфиги/языки (можно переопределить в env)
+TESS_LANGS_DEFAULT = "bel+rus+eng"
+TESS_LANGS = os.getenv("TESS_LANGS", TESS_LANGS_DEFAULT)
+TESS_CONFIG = os.getenv("TESS_CONFIG", "--oem 3 --psm 6 -c preserve_interword_spaces=1")
 
 if not TELEGRAM_TOKEN:
     raise SystemExit("Нет TELEGRAM_TOKEN (flyctl secrets set TELEGRAM_TOKEN=...)")
@@ -52,6 +59,7 @@ USER_SUBJECT = defaultdict(lambda: "auto")
 USER_GRADE = defaultdict(lambda: "8")
 PARENT_MODE = defaultdict(lambda: False)
 USER_STATE = defaultdict(lambda: None)  # None | "AWAIT_EXPLAIN" | "AWAIT_ESSAY" | "AWAIT_FOLLOWUP" | "AWAIT_TEXT_OR_PHOTO_CHOICE"
+USER_LANG = defaultdict(lambda: "auto")  # 'auto' | 'ru' | 'be'
 
 def kb(uid: int) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -65,7 +73,6 @@ def kb(uid: int) -> ReplyKeyboardMarkup:
 
 # ---------- НАДЁЖНАЯ ОЧИСТКА HTML ----------
 ALLOWED_TAGS = {"b", "i", "code", "pre"}  # <a> убираем — не нужен и может ломать Telegram
-
 _TAG_OPEN = {t: f"&lt;{t}&gt;" for t in ALLOWED_TAGS}
 _TAG_CLOSE = {t: f"&lt;/{t}&gt;" for t in ALLOWED_TAGS}
 
@@ -73,13 +80,9 @@ def sanitize_html(text: str) -> str:
     """Экранируем всё и точечно возвращаем только <b>, <i>, <code>, <pre>."""
     if not text:
         return ""
-    # 0) убрать нули и нормализовать переносы
     text = text.replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
-    # 1) унифицировать <br> в перенос строки
     text = re.sub(r"<\s*br\s*/?\s*>", "\n", text, flags=re.I)
-    # 2) экранировать всё как текст
     escaped = html.escape(text, quote=False)
-    # 3) вернуть whitelisted теги (без атрибутов)
     for t in ALLOWED_TAGS:
         escaped = re.sub(
             fr"{_TAG_OPEN[t]}(.*?){_TAG_CLOSE[t]}",
@@ -87,7 +90,6 @@ def sanitize_html(text: str) -> str:
             escaped,
             flags=re.IGNORECASE | re.DOTALL,
         )
-    # 4) ограничить длину безопасного HTML
     return escaped[:4000]
 
 async def safe_reply_html(message, text: str, **kwargs):
@@ -108,33 +110,43 @@ async def safe_reply_html(message, text: str, **kwargs):
             )
         raise
 
+# ---------- ЯЗЫК ВВОДА (RU / BE) ----------
+def detect_lang(text: str) -> str:
+    """Грубая, но надёжная эвристика: если есть 'ў' — это белорусский."""
+    t = (text or "").lower()
+    if "ў" in t:
+        return "be"
+    # доп. подсказка: много 'і' и мало 'и'
+    if t.count("і") >= 2 and t.count("и") == 0:
+        return "be"
+    return "ru"
+
 def sys_prompt(uid: int) -> str:
     subject = USER_SUBJECT[uid]
     grade = USER_GRADE[uid]
     parent = PARENT_MODE[uid]
 
-    # Поддержка белорусского языка
-    if subject in ["беларуская мова", "беларуская літаратура"]:
+    # белорусский — по предмету ИЛИ по авто-детекту
+    be_needed = subject in ["беларуская мова", "беларуская літаратура"] or USER_LANG[uid] == "be"
+
+    if be_needed:
         return (
-            "Ты — ІІ-памочнік па беларускай мове і літаратуры. "
-            "Адказвай на беларускай, калі заданне на беларускай. "
-            "Калі на расейскай — адказвай на расейскай. "
-            "Памятай пра правілы: літара 'ў', мяккі знак, і інш. "
-            "Адказ пішы толькі на беларускай мове. "
-            "Выкарыстоўвай толькі HTML-тэгі для фарматавання: <b>тлусты</b>, <i>курсіў</i>, <code>код</code>. "
-            "Не выкарыстоўвай Markdown (**, *, `)."
+            "Ты — ІІ-памочнік для школьнікаў. Адказвай на беларускай мове, "
+            "калі заданне або тэкст на беларускай. Калі карыстальнік піша па-руску — адказвай па-руску. "
+            "Тлумач сітуацыю проста і па кроках, як старэйшы брат. "
+            "Структура: 1) Умова → 2) Рашэнне па кроках (з тлумачэннямі) → 3) Каротка. "
+            "Дай 1–2 пытанні па тэме з падказкамі. "
+            "Выкарыстоўвай ТОЛЬКІ HTML-тэгі: <b>, <i>, <code>, <pre>. Без Markdown."
         )
 
     base = (
         "Ты — ИИ-репетитор. Объясняй как старший брат: просто, по шагам, с короткими аналогиями. "
-        "Структура: 1) Условие → 2) Решение по шагам (с объяснением каждого действия) → 3) Кратко (для тех, кто не понял с первого раза). "
-        "Добавляй 1–2 вопроса ПО ЭТОМУ ЗАДАНИЮ — с подсказками, не давая полный ответ. "
-        "Не задавай общие вопросы. Не уходи в темы, не связанные с заданием. "
-        "Не вступай в диалог. Вопрос — это часть объяснения, не приглашение к беседе. "
-        "Ответ должен использовать только HTML-теги для форматирования: <b>жирный</b>, <i>курсив</i>, <code>моноширинный</code>. "
-        "Не используй Markdown (**, *, `)."
+        "Структура: 1) Условие → 2) Решение по шагам (с объяснением каждого действия) → 3) Кратко. "
+        "Добавляй 1–2 вопроса по теме с подсказками. "
+        "Если вход на белорусском — отвечай на белорусском; если на русском — на русском. "
+        "Ответ использует только HTML-теги: <b>, <i>, <code>, <pre>. Без Markdown."
     )
-    sub = f"Предмет: {subject}." if subject != "auto" else "Определи сам."
+    sub = f"Предмет: {subject}." if subject != "auto" else "Определи предмет сам."
     grd = f"Класс: {grade}."
     par = (
         "<b>Памятка для родителей:</b><br>"
@@ -143,6 +155,58 @@ def sys_prompt(uid: int) -> str:
         "3) Как мягко помочь, если не понимает."
     ) if parent else ""
     return f"{base} {sub} {grd} {par}"
+
+# ---------- OCR: препроцесс и каскад языков ----------
+def _preprocess_image(img: Image.Image) -> Image.Image:
+    # автоповорот по EXIF
+    img = ImageOps.exif_transpose(img)
+    # к ч/б + автоконтраст
+    img = img.convert("L")
+    img = ImageOps.autocontrast(img)
+    # лёгкое шумоподавление/резкость
+    img = img.filter(ImageFilter.MedianFilter(size=3))
+    img = ImageEnhance.Sharpness(img).enhance(1.2)
+    # апскейл для мелкого текста
+    max_w = 1800
+    if img.width < max_w:
+        scale = min(max_w / img.width, 3.0)
+        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+    return img
+
+def _ocr_with_langs(img: Image.Image, langs_list) -> str:
+    """Пробуем языки по очереди, пока не получится что-то осмысленное."""
+    for langs in langs_list:
+        try:
+            txt = pytesseract.image_to_string(img, lang=langs, config=TESS_CONFIG)
+            if txt and txt.strip():
+                log.info(f"OCR success with langs='{langs}': {repr(txt[:60])}")
+                return txt.strip()
+        except TesseractError as e:
+            log.warning(f"OCR langs='{langs}' failed: {e}")
+            continue
+    return ""
+
+def ocr_image(img: Image.Image) -> str:
+    pimg = _preprocess_image(img)
+    # основной порядок: env → bel+rus+eng → rus+eng → rus → eng
+    langs_chain = []
+    if TESS_LANGS:
+        langs_chain.append(TESS_LANGS)
+    for l in ["bel+rus+eng", "rus+eng", "rus", "eng"]:
+        if l not in langs_chain:
+            langs_chain.append(l)
+    text = _ocr_with_langs(pimg, langs_chain)
+    if not text:
+        # последний шанс — без препроцесса
+        text = _ocr_with_langs(img, ["rus+eng", "rus", "eng"])
+    return text or ""
+
+# Показать доступные языки в логах (если доступно)
+try:
+    avail_langs = pytesseract.get_languages(config="")
+    log.info(f"Tesseract languages available: {avail_langs}")
+except Exception as _:
+    pass
 
 # ---------- КОМАНДЫ ----------
 async def set_commands(app: Application):
@@ -179,21 +243,17 @@ async def about_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>📘 О боте «Готово!»</b>\n\n"
         "Я — школьный помощник, который помогает с домашкой, "
         "объясняя как старший брат: просто, по шагам, без воды.\n\n"
-
         "<b>🎯 Что я умею:</b>\n"
         "• 📸 Присылай фото задания — я его распознаю, решу и объясню\n"
         "• 🧠 Напиши /explain — объясню любую тему\n"
         "• 📝 Напиши /essay — напишу сочинение\n"
         "• 📚 Можешь выбрать предмет и класс\n"
         "• 👨‍👩‍👧 Включи режим для родителей — получишь памятку\n\n"
-
         "<b>📌 Как пользоваться:</b>\n"
         "1. Жми кнопки в меню\n"
         "2. Или пиши команду: /help, /essay, /explain\n"
         "3. После ответа — можешь уточнить: «Да» или «Нет»\n\n"
-
         "<b>💡 Совет:</b> Если фото не распознал — попробуй переснять или напиши текстом.\n\n"
-
         "Создан для учеников 5–11 классов. © 2025",
         reply_markup=kb(update.effective_user.id)
     )
@@ -226,6 +286,8 @@ async def parent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- GPT-хелперы ----------
 async def gpt_explain(uid: int, prompt: str, prepend_prompt: bool = True) -> str:
     log.info(f"EXPLAIN uid={uid} subj={USER_SUBJECT[uid]} grade={USER_GRADE[uid]} text={prompt[:60]}")
+    # детект языка по входу, чтобы форсить белорусский при необходимости
+    USER_LANG[uid] = detect_lang(prompt)
     user_content = f"Объясни простыми словами: {prompt}" if prepend_prompt else prompt
     resp = await client.chat.completions.create(
         model="gpt-4o",
@@ -240,10 +302,11 @@ async def gpt_explain(uid: int, prompt: str, prepend_prompt: bool = True) -> str
 
 async def gpt_essay(uid: int, topic: str) -> str:
     log.info(f"ESSAY uid={uid} topic={topic[:60]}")
+    USER_LANG[uid] = detect_lang(topic)
     resp = await client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": f"Ты — ученик {USER_GRADE[uid]} класса. Пиши сочинение как ученик: просто, по делу, 150–200 слов. Без вступлений в диалог. Ответ должен использовать только HTML-теги для форматирования: <b>жирный</b>, <i>курсив</i>, <code>моноширинный</code>. Не используй Markdown (**, *, `)."},
+            {"role": "system", "content": sys_prompt(uid)},
             {"role": "user", "content": f"Напиши сочинение. Тема: {topic}"}
         ],
         temperature=0.7,
@@ -277,28 +340,23 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("📝 Тема сочинения?", reply_markup=kb(uid))
     try:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-
-        # Шаг 1: Сочинение
         essay = await gpt_essay(uid, topic)
         await safe_reply_html(update.message, essay, reply_markup=kb(uid))
 
-        # Шаг 2: План
         plan_prompt = (
             f"Составь нумерованный план сочинения на тему '{topic}'. "
-            "Каждый пункт короткий. Используй только HTML-теги <b>, <i>, <code>."
+            "Каждый пункт короткий. Используй только HTML-теги <b>, <i>, <code>, <pre>."
         )
         plan = await gpt_explain(uid, plan_prompt, prepend_prompt=False)
         await safe_reply_html(update.message, plan, reply_markup=kb(uid))
 
-        # Шаг 3: Обоснование структуры
         reason_prompt = (
             f"Кратко объясни, почему для сочинения на тему '{topic}' выбран такой план. "
-            "Ответ должен использовать только HTML-теги <b>, <i>, <code>."
+            "Ответ должен использовать только HTML-теги <b>, <i>, <code>, <pre>."
         )
         reason = await gpt_explain(uid, reason_prompt, prepend_prompt=False)
         await safe_reply_html(update.message, reason, reply_markup=kb(uid))
 
-        # Шаг 4: Уточнение
         keyboard = ReplyKeyboardMarkup([["Да", "Нет"]], resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("Хочешь уточнить по сочинению?", reply_markup=keyboard)
         USER_STATE[uid] = "AWAIT_FOLLOWUP"
@@ -313,11 +371,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = await update.message.photo[-1].get_file()
         data = await file.download_as_bytearray()
         img = Image.open(io.BytesIO(data))
-        ocr_text = pytesseract.image_to_string(img, lang="rus+eng").strip()
+
+        ocr_text = ocr_image(img)
         log.info(f"OCR uid={uid} text={ocr_text!r}")
 
         if not ocr_text:
             raise ValueError("OCR returned empty text")
+
+        # автоопределение языка по фото
+        USER_LANG[uid] = detect_lang(ocr_text)
 
         ocr_text = ocr_text[:4000]  # ограничение длины
         out = await gpt_explain(uid, ocr_text)
@@ -341,6 +403,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_text = (update.message.text or "").strip()
     text = raw_text.lower()
     state = USER_STATE[uid]
+
+    # Авто-детект языка для обычного текста
+    if raw_text:
+        USER_LANG[uid] = detect_lang(raw_text)
 
     # Обработка выбора после фото
     if state == "AWAIT_TEXT_OR_PHOTO_CHOICE":
