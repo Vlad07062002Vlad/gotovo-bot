@@ -73,8 +73,8 @@ def kb(uid: int) -> ReplyKeyboardMarkup:
 
 # ---------- НАДЁЖНАЯ ОЧИСТКА HTML ----------
 ALLOWED_TAGS = {"b", "i", "code", "pre"}  # <a> убираем — не нужен и может ломать Telegram
-_TAG_OPEN = {t: f"&lt;{t}&gt;" for t in ALLOWED_TAGS}
-_TAG_CLOSE = {t: f"&lt;/{t}&gt;" for t in ALLOWED_TAGS}
+_TAG_OPEN = {t: f"<{t}>" for t in ALLOWED_TAGS}
+_TAG_CLOSE = {t: f"</{t}>" for t in ALLOWED_TAGS}
 
 def sanitize_html(text: str) -> str:
     """Экранируем всё и точечно возвращаем только <b>, <i>, <code>, <pre>."""
@@ -125,10 +125,9 @@ def sys_prompt(uid: int) -> str:
     subject = USER_SUBJECT[uid]
     grade = USER_GRADE[uid]
     parent = PARENT_MODE[uid]
+    lang = USER_LANG[uid]
 
-    be_needed = subject in ["беларуская мова", "беларуская літаратура"] or USER_LANG[uid] == "be"
-
-    if be_needed:
+    if lang == "be":
         base = (
             "Ты — ІІ-памочнік для школьнікаў і ВЫКАНАЎЦА Д/З. "
             "Калі перад табой школьнае заданне (упражненні, пропускі, скланенні, нумараваныя пункты), "
@@ -162,7 +161,6 @@ def sys_prompt(uid: int) -> str:
         "3) Как мягко помочь, если не понимает."
     ) if parent else ""
     return f"{base} {sub} {grd} {par}"
-
 
 # ---------- OCR: препроцесс и каскад языков ----------
 def _preprocess_image(img: Image.Image) -> Image.Image:
@@ -242,7 +240,6 @@ def ocr_image(img: Image.Image) -> str:
 
     return ""
 
-
 # ---------- КОМАНДЫ ----------
 async def set_commands(app: Application):
     await app.bot.set_my_commands([
@@ -278,17 +275,21 @@ async def about_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>📘 О боте «Готово!»</b>\n\n"
         "Я — школьный помощник, который помогает с домашкой, "
         "объясняя как старший брат: просто, по шагам, без воды.\n\n"
+
         "<b>🎯 Что я умею:</b>\n"
         "• 📸 Присылай фото задания — я его распознаю, решу и объясню\n"
         "• 🧠 Напиши /explain — объясню любую тему\n"
         "• 📝 Напиши /essay — напишу сочинение\n"
         "• 📚 Можешь выбрать предмет и класс\n"
         "• 👨‍👩‍👧 Включи режим для родителей — получишь памятку\n\n"
+
         "<b>📌 Как пользоваться:</b>\n"
         "1. Жми кнопки в меню\n"
         "2. Или пиши команду: /help, /essay, /explain\n"
         "3. После ответа — можешь уточнить: «Да» или «Нет»\n\n"
+
         "<b>💡 Совет:</b> Если фото не распознал — попробуй переснять или напиши текстом.\n\n"
+
         "Создан для учеников 5–11 классов. © 2025",
         reply_markup=kb(update.effective_user.id)
     )
@@ -320,7 +321,7 @@ async def parent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- GPT-хелперы ----------
 async def gpt_explain(uid: int, prompt: str, prepend_prompt: bool = True) -> str:
-    log.info(f"EXPLAIN/ SOLVE uid={uid} subj={USER_SUBJECT[uid]} grade={USER_GRADE[uid]} text={prompt[:60]}")
+    log.info(f"EXPLAIN uid={uid} subj={USER_SUBJECT[uid]} grade={USER_GRADE[uid]} text={prompt[:60]}")
     # определяем язык входа (для формулировки задания)
     USER_LANG[uid] = detect_lang(prompt)
 
@@ -354,7 +355,6 @@ async def gpt_explain(uid: int, prompt: str, prepend_prompt: bool = True) -> str
         max_tokens=900
     )
     return resp.choices[0].message.content.strip()
-
 
 async def gpt_essay(uid: int, topic: str) -> str:
     log.info(f"ESSAY uid={uid} topic={topic[:60]}")
@@ -396,9 +396,12 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("📝 Тема сочинения?", reply_markup=kb(uid))
     try:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+
+        # Шаг 1: Сочинение
         essay = await gpt_essay(uid, topic)
         await safe_reply_html(update.message, essay, reply_markup=kb(uid))
 
+        # Шаг 2: План
         plan_prompt = (
             f"Составь нумерованный план сочинения на тему '{topic}'. "
             "Каждый пункт короткий. Используй только HTML-теги <b>, <i>, <code>, <pre>."
@@ -406,6 +409,7 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         plan = await gpt_explain(uid, plan_prompt, prepend_prompt=False)
         await safe_reply_html(update.message, plan, reply_markup=kb(uid))
 
+        # Шаг 3: Обоснование структуры
         reason_prompt = (
             f"Кратко объясни, почему для сочинения на тему '{topic}' выбран такой план. "
             "Ответ должен использовать только HTML-теги <b>, <i>, <code>, <pre>."
@@ -413,6 +417,7 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reason = await gpt_explain(uid, reason_prompt, prepend_prompt=False)
         await safe_reply_html(update.message, reason, reply_markup=kb(uid))
 
+        # Шаг 4: Уточнение
         keyboard = ReplyKeyboardMarkup([["Да", "Нет"]], resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("Хочешь уточнить по сочинению?", reply_markup=keyboard)
         USER_STATE[uid] = "AWAIT_FOLLOWUP"
@@ -463,7 +468,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=keyboard
         )
         USER_STATE[uid] = "AWAIT_TEXT_OR_PHOTO_CHOICE"
-
 
 # ---------- Текст и кнопки ----------
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
