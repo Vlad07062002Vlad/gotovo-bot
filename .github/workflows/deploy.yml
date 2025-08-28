@@ -1,4 +1,5 @@
 name: Deploy to Fly.io
+
 on:
   push:
     branches: [ main ]
@@ -7,10 +8,43 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      APP: ${{ secrets.FLY_APP }} # в секрете должно быть 'gotovo-bot'
     steps:
-      - uses: actions/checkout@v4
-      - uses: superfly/flyctl-actions/setup-flyctl@v1
-      - name: Deploy from source (remote builder)
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@v1
+
+      - name: Sanity check APP name
+        run: |
+          if [ -z "${APP}" ]; then
+            echo "::error::Missing secrets.FLY_APP (set to your app name, e.g. gotovo-bot)"
+            exit 1
+          fi
+          echo "Deploying to app=${APP}"
+
+      - name: Deploy (remote builder)
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: flyctl deploy -a gotovo-bot --wait-timeout 600
+        run: |
+          flyctl deploy --remote-only -a "${APP}" --wait-timeout 600
+
+      - name: Show status
+        if: always()
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          flyctl status -a "${APP}" || true
+          flyctl releases -a "${APP}" || true
+          flyctl machines list --app "${APP}" || true
+
+      - name: Tail last logs on failure
+        if: failure()
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          echo "---- Last 200 log lines ----"
+          flyctl logs -a "${APP}" --max-lines 200 || true
+
