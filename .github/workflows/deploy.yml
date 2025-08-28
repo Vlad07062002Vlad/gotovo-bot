@@ -1,30 +1,49 @@
 name: Deploy to Fly.io
+
 on:
-  push: { branches: [ main ] }
+  push:
+    branches: [ main ]
   workflow_dispatch:
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    env: { APP: ${{ secrets.FLY_APP }} }
+    env:
+      APP: ${{ secrets.FLY_APP }}   # в секрет положи 'gotovo-bot'
     steps:
-      - uses: actions/checkout@v4
-      - uses: superfly/flyctl-actions/setup-flyctl@v1
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@v1
+
       - name: Sanity
         run: |
-          test -n "${APP}" || (echo "::error::Set secrets.FLY_APP"; exit 1)
-          echo "Deploying to ${APP}"
+          if [ -z "${APP}" ]; then
+            echo "::error::Missing secrets.FLY_APP (set to your Fly app name, e.g. gotovo-bot)"
+            exit 1
+          fi
+          echo "Deploying to app=${APP}"
+
       - name: Deploy (remote builder)
-        env: { FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }} }
-        run: flyctl deploy --remote-only -a "${APP}" --wait-timeout 600
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          flyctl deploy --remote-only -a "${APP}" --wait-timeout 600
+
       - name: Status
         if: always()
-        env: { FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }} }
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: |
           flyctl status -a "${APP}" || true
           flyctl releases -a "${APP}" || true
           flyctl machines list --app "${APP}" || true
+
       - name: Tail logs on failure
         if: failure()
-        env: { FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }} }
-        run: flyctl logs -a "${APP}" --max-lines 200 || true
-
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          echo "---- Last 200 log lines ----"
+          flyctl logs -a "${APP}" --max-lines 200 || true
