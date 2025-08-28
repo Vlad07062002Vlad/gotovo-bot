@@ -1068,18 +1068,18 @@ class _Health(BaseHTTPRequestHandler):
                 return self._ok(msg.encode("utf-8"))
 
             if self.path == "/vdb/upsert":
-    if auth != VDB_WEBHOOK_SECRET or not VDB_WEBHOOK_SECRET:
-        return self._err(401, "bad auth")
-    rules = data.get("rules") or []
-    try:
+                if auth != VDB_WEBHOOK_SECRET or not VDB_WEBHOOK_SECRET:
+                    return self._err(401, "bad auth")
+                rules = data.get("rules") or []
+                try:
         # Если список пуст — не трогаем OpenAI/ВБД, просто отвечаем ок
-        if not rules:
-            return self._ok(b"VDB upsert ok (0)")
-        from rag_vdb import upsert_rules
-        asyncio.run(upsert_rules(client, rules))
-        return self._ok(b"VDB upsert ok")
-    except Exception as e:
-        return self._err(500, f"upsert failed: {e}")
+                    if not rules:
+                        return self._ok(b"VDB upsert ok (0)")
+                    from rag_vdb import upsert_rules
+                    asyncio.run(upsert_rules(client, rules))
+                    return self._ok(b"VDB upsert ok")
+               except Exception as e:
+                    return self._err(500, f"upsert failed: {e}")
 
 
 def _run_health():
