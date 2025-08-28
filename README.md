@@ -35,7 +35,8 @@ pip install -r requirements.txt
 
 # 4. Задаём переменные окружения
 cp .env.sample .env
-# открой .env и пропиши TELEGRAM_TOKEN, OPENAI_API_KEY, VDB_WEBHOOK_SECRET и т.д.
+# открой .env и пропиши TELEGRAM_TOKEN, OPENAI_API_KEY, VDB_WEBHOOK_SECRET,
+# SQLITE_PATH, BEPAID_SHOP_ID и другие ключи.
 
 # 5. Запускаем
 python bot.py
