@@ -31,4 +31,5 @@ jobs:
           fi
 
       - name: Deploy to Fly.io (remote builder)
-        run: flyctl deploy --remote-only --app "$APP"
+        run: flyctl deploy --remote-only --app "gotovo-bot"
+
