@@ -24,6 +24,9 @@ def vdb() -> QdrantClient:
     return _client
 
 async def embed_texts(ai: AsyncOpenAI, texts: List[str]) -> List[List[float]]:
+    # Короткое замыкание: нечего встраивать — нечего звать OpenAI
+    if not texts:
+        return []
     # batched embeddings
     resp = await ai.embeddings.create(model=EMBED_MODEL, input=texts)
     return [d.embedding for d in resp.data]
@@ -35,6 +38,9 @@ async def upsert_rules(ai: AsyncOpenAI, rules: List[Dict]):
        "rule_brief": "25–40 слов своими словами...",
        "subject":"math","grade":7,"book":"Алгебра 7 (Иванов, 2021)","chapter":"Линейные уравнения","page":45}
     """
+    # Короткое замыкание: пусто — просто выходим
+    if not rules:
+        return
     vecs = await embed_texts(ai, [r["rule_brief"] for r in rules])
     points = []
     for r, v in zip(rules, vecs):
