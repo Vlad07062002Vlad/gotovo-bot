@@ -51,14 +51,14 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PORT = int(os.getenv("PORT", "8080"))
 
 # Платежи (UI/витрина завязана на сервис payments; здесь — флаги окружения)
-TELEGRAM_STARS_ENABLED = os.getenv("TELEGRAM_STARS_ENABLED","true").lower()=="true"
+TELEGRAM_STARS_ENABLED = os.getenv("TELEGRAM_STARS_ENABLED", "true").lower() == "true"
 # Для Stars provider_token должен быть пустым. Для карт/ЕРИП тут будет токен провайдера (если используешь Telegram Payments провайдера).
-TELEGRAM_PROVIDER_TOKEN = os.getenv("TELEGRAM_PROVIDER_TOKEN","")
+TELEGRAM_PROVIDER_TOKEN = os.getenv("TELEGRAM_PROVIDER_TOKEN", "")
 
-CARD_CHECKOUT_URL = os.getenv("CARD_CHECKOUT_URL","")  # витрина «оплата картой РБ»
-ERIP_CHECKOUT_URL = os.getenv("ERIP_CHECKOUT_URL","")  # витрина «ЕРИП»
-CARD_WEBHOOK_SECRET = os.getenv("CARD_WEBHOOK_SECRET","")  # X-Auth к /webhook/card
-ERIP_WEBHOOK_SECRET = os.getenv("ERIP_WEBHOOK_SECRET","")  # X-Auth к /webhook/erip
+CARD_CHECKOUT_URL = os.getenv("CARD_CHECKOUT_URL", "")  # витрина «оплата картой РБ»
+ERIP_CHECKOUT_URL = os.getenv("ERIP_CHECKOUT_URL", "")  # витрина «ЕРИП»
+CARD_WEBHOOK_SECRET = os.getenv("CARD_WEBHOOK_SECRET", "")  # X-Auth к /webhook/card
+ERIP_WEBHOOK_SECRET = os.getenv("ERIP_WEBHOOK_SECRET", "")  # X-Auth к /webhook/erip
 
 # ВБД-хук
 VDB_WEBHOOK_SECRET = os.getenv("VDB_WEBHOOK_SECRET", "")
@@ -85,14 +85,17 @@ client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 def _db_followup():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("""CREATE TABLE IF NOT EXISTS followup_state(
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS followup_state(
         user_id INTEGER PRIMARY KEY,
         last_task TEXT,
         last_answer TEXT,
         ts INTEGER,
         used_free INTEGER
-    )""")
+    )"""
+    )
     return conn
+
 
 def _now_day_ym():
     now = int(time.time())
@@ -100,12 +103,23 @@ def _now_day_ym():
     ym = time.strftime("%Y%m", time.gmtime(now))
     return now, day, ym
 
+
 # ---------- ПАМЯТЬ (RAM) ----------
 SUBJECTS = {
-    "математика","русский","английский","физика","химия",
-    "история","обществознание","биология","информатика",
-    "география","литература","auto",
-    "беларуская мова","беларуская літаратура"
+    "математика",
+    "русский",
+    "английский",
+    "физика",
+    "химия",
+    "история",
+    "обществознание",
+    "биология",
+    "информатика",
+    "география",
+    "литература",
+    "auto",
+    "беларуская мова",
+    "беларуская літаратура",
 }
 SUBJECT_VDB_KEY = {
     "математика": "math",
@@ -122,121 +136,183 @@ SUBJECT_VDB_KEY = {
     "беларуская мова": "bel_mova",
     "беларуская літаратура": "bel_lit",
 }
+
+
 def subject_to_vdb_key(s: str) -> str:
     s = (s or "").strip().lower()
     return SUBJECT_VDB_KEY.get(s, s)
 
+
 USER_SUBJECT = defaultdict(lambda: "auto")
-USER_GRADE   = defaultdict(lambda: "8")
-PARENT_MODE  = defaultdict(lambda: True)
-USER_STATE   = defaultdict(lambda: None)
-USER_LANG    = defaultdict(lambda: "ru")
-PRO_NEXT     = defaultdict(lambda: False)
+USER_GRADE = defaultdict(lambda: "8")
+PARENT_MODE = defaultdict(lambda: True)
+USER_STATE = defaultdict(lambda: None)
+USER_LANG = defaultdict(lambda: "ru")
+PRO_NEXT = defaultdict(lambda: False)
 
 # ---- Follow-up контекст (1 бесплатное уточнение, 15 минут)
-FOLLOWUP_FREE_WINDOW_SEC = 15*60
+FOLLOWUP_FREE_WINDOW_SEC = 15 * 60
+
+
 def set_followup_context(uid: int, task_text: str, answer_text: str):
     snippet_task = (task_text or "").strip()[:1200]
-    snippet_ans  = (answer_text or "").strip()[:1200]
+    snippet_ans = (answer_text or "").strip()[:1200]
     now = int(time.time())
     with _db_followup() as db:
-        db.execute("""INSERT INTO followup_state(user_id,last_task,last_answer,ts,used_free)
+        db.execute(
+            """INSERT INTO followup_state(user_id,last_task,last_answer,ts,used_free)
                       VALUES(?,?,?,?,0)
                       ON CONFLICT(user_id) DO UPDATE SET
                         last_task=?,
                         last_answer=?,
                         ts=?,
                         used_free=0
-                   """, (uid, snippet_task, snippet_ans, now, snippet_task, snippet_ans, now))
+                   """,
+            (uid, snippet_task, snippet_ans, now, snippet_task, snippet_ans, now),
+        )
+
 
 def get_followup_context(uid: int):
     with _db_followup() as db:
-        row = db.execute("SELECT last_task,last_answer,ts,used_free FROM followup_state WHERE user_id=?", (uid,)).fetchone()
+        row = db.execute(
+            "SELECT last_task,last_answer,ts,used_free FROM followup_state WHERE user_id=?",
+            (uid,),
+        ).fetchone()
     if not row:
         return None
-    return {"task": row[0] or "", "answer": row[1] or "", "ts": row[2] or 0, "used_free": bool(row[3])}
+    return {
+        "task": row[0] or "",
+        "answer": row[1] or "",
+        "ts": row[2] or 0,
+        "used_free": bool(row[3]),
+    }
+
 
 def mark_followup_used(uid: int):
     with _db_followup() as db:
         db.execute("UPDATE followup_state SET used_free=1 WHERE user_id=?", (uid,))
 
-def in_free_window(ctx: dict|None) -> bool:
-    if not ctx: return False
-    return int(time.time()) - int(ctx.get("ts",0)) <= FOLLOWUP_FREE_WINDOW_SEC
+
+def in_free_window(ctx: dict | None) -> bool:
+    if not ctx:
+        return False
+    return int(time.time()) - int(ctx.get("ts", 0)) <= FOLLOWUP_FREE_WINDOW_SEC
+
 
 # ---------- Клавиатура ----------
 def kb(uid: int) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             ["🧠 Объяснить", "📝 Сочинение", "⭐ Pro (след. запрос)"],
-            [f"📚 Предмет: {USER_SUBJECT[uid]}", f"🎓 Класс: {USER_GRADE[uid]}", f"👨‍👩‍👧 Родит.: {'вкл' if PARENT_MODE[uid] else 'выкл'}"],
-            ["ℹ️ Free vs Pro", "💳 Купить", "🧾 Моя статистика"]
+            [
+                f"📚 Предмет: {USER_SUBJECT[uid]}",
+                f"🎓 Класс: {USER_GRADE[uid]}",
+                f"👨‍👩‍👧 Родит.: {'вкл' if PARENT_MODE[uid] else 'выкл'}",
+            ],
+            ["ℹ️ Free vs Pro", "💳 Купить", "🧾 Моя статистика"],
         ],
-        resize_keyboard=True
+        resize_keyboard=True,
     )
 
+
 # ---------- Безопасный HTML ----------
-ALLOWED_TAGS = {"b","i","code","pre"}
+ALLOWED_TAGS = {"b", "i", "code", "pre"}
 _TAG_OPEN = {t: f"&lt;{t}&gt;" for t in ALLOWED_TAGS}
-_TAG_CLOSE= {t: f"&lt;/{t}&gt;" for t in ALLOWED_TAGS}
+_TAG_CLOSE = {t: f"&lt;/{t}&gt;" for t in ALLOWED_TAGS}
+
 
 def sanitize_html(text: str) -> str:
-    if not text: return ""
-    text = text.replace("\x00","").replace("\r\n","\n").replace("\r","\n")
-    text = re.sub(r"<\s*br\s*/?\s*>","\n", text, flags=re.I)
+    if not text:
+        return ""
+    text = text.replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"<\s*br\s*/?\s*>", "\n", text, flags=re.I)
     esc = html.escape(text, quote=False)
     for t in ALLOWED_TAGS:
-        esc = re.sub(fr"{_TAG_OPEN[t]}(.*?){_TAG_CLOSE[t]}", fr"<{t}>\1</{t}>", esc, flags=re.I|re.S)
+        esc = re.sub(
+            fr"{_TAG_OPEN[t]}(.*?){_TAG_CLOSE[t]}",
+            fr"<{t}>\1</{t}>",
+            esc,
+            flags=re.I | re.S,
+        )
     return esc[:4000]
+
 
 async def safe_reply_html(message: Message, text: str, **kwargs):
     try:
-        return await message.reply_text(sanitize_html(text), parse_mode="HTML", disable_web_page_preview=True, **kwargs)
+        return await message.reply_text(
+            sanitize_html(text), parse_mode="HTML", disable_web_page_preview=True, **kwargs
+        )
     except BadRequest as e:
         if "Can't parse entities" in str(e):
-            return await message.reply_text(html.escape(text)[:4000], disable_web_page_preview=True, **kwargs)
+            return await message.reply_text(
+                html.escape(text)[:4000], disable_web_page_preview=True, **kwargs
+            )
         raise
 
+
 # ---------- Спиннер ----------
-async def start_spinner(update: Update, context: ContextTypes.DEFAULT_TYPE, label="Обрабатываю…", interval=1.6):
+async def start_spinner(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, label="Обрабатываю…", interval=1.6
+):
     msg = await update.message.reply_text(f"⏳ {label}")
     stop = asyncio.Event()
     current_label = label
+
     def set_label(s: str):
-        nonlocal current_label; current_label = s
+        nonlocal current_label
+        current_label = s
+
     async def worker():
-        frames = ["⏳","⌛","🕐","🕑","🕒","🕓","🕔","🕕","🕖","🕗","🕘","🕙","🕚","🕛"]
-        i=0
+        frames = ["⏳", "⌛", "🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚", "🕛"]
+        i = 0
         while not stop.is_set():
-            i=(i+1)%len(frames)
-            try: await msg.edit_text(f"{frames[i]} {current_label}")
-            except Exception: pass
+            i = (i + 1) % len(frames)
+            try:
+                await msg.edit_text(f"{frames[i]} {current_label}")
+            except Exception:
+                pass
             await asyncio.sleep(interval)
+
     task = asyncio.create_task(worker())
-    async def finish(final_text: str=None, delete: bool=True):
+
+    async def finish(final_text: str = None, delete: bool = True):
         stop.set()
-        try: await task
-        except Exception: pass
         try:
-            if final_text: await msg.edit_text(final_text)
-            if delete: await msg.delete()
-        except Exception: pass
+            await task
+        except Exception:
+            pass
+        try:
+            if final_text:
+                await msg.edit_text(final_text)
+            if delete:
+                await msg.delete()
+        except Exception:
+            pass
+
     return finish, set_label
+
 
 # ---------- Детект языка ----------
 def detect_lang(text: str) -> str:
     tl = (text or "").lower()
-    if "ў" in tl or (tl.count("і")>=2 and tl.count("и")==0): return "be"
-    if any(ch in tl for ch in ("ä","ö","ü","ß")): return "de"
-    if any(ch in tl for ch in ("à","â","ä","ç","é","è","ê","ë","î","ï","ô","ö","ù","û","ü","ÿ","œ")): return "fr"
-    cyr = sum('а'<=ch<='я' or 'А'<=ch<='Я' or ch in 'ёЁ' for ch in tl)
-    lat = sum('a'<=ch<='z' for ch in tl)
-    if lat > cyr*1.2: return "en"
+    if "ў" in tl or (tl.count("і") >= 2 and tl.count("и") == 0):
+        return "be"
+    if any(ch in tl for ch in ("ä", "ö", "ü", "ß")):
+        return "de"
+    if any(ch in tl for ch in ("à", "â", "ä", "ç", "é", "è", "ê", "ë", "î", "ï", "ô", "ö", "ù", "û", "ü", "ÿ", "œ")):
+        return "fr"
+    cyr = sum("а" <= ch <= "я" or "А" <= ch <= "Я" or ch in "ёЁ" for ch in tl)
+    lat = sum("a" <= ch <= "z" for ch in tl)
+    if lat > cyr * 1.2:
+        return "en"
     return "ru"
+
 
 # ---------- Системный промпт ----------
 def sys_prompt(uid: int) -> str:
-    subject = USER_SUBJECT[uid]; grade = USER_GRADE[uid]; parent = PARENT_MODE[uid]
+    subject = USER_SUBJECT[uid]
+    grade = USER_GRADE[uid]
+    parent = PARENT_MODE[uid]
 
     base = (
         "Ты — школьный помощник и ИСПОЛНИТЕЛЬ домашнего задания. "
@@ -252,48 +328,73 @@ def sys_prompt(uid: int) -> str:
         "Для схем используй текстовые блоки. "
         "Разрешённые HTML-теги: <b>, <i>, <code>, <pre>."
     )
-    form_hint = "Ключевые формулы выделяй отдельной строкой в блоке <pre> и при возможности добавляй: TeX: \\int_0^1 x^2\\,dx"
-    sub = f"Предмет: {subject}." if subject!="auto" else "Определи предмет сам."
+    form_hint = (
+        "Ключевые формулы выделяй отдельной строкой в блоке <pre> и при возможности добавляй: TeX: \\int_0^1 x^2\\,dx"
+    )
+    sub = f"Предмет: {subject}." if subject != "auto" else "Определи предмет сам."
     grd = f"Класс: {grade}."
-    par = ("<b>Памятка для родителей:</b> на что смотреть при проверке; что должен проговорить ребёнок; типичные ошибки; мини-тренировка.")
-    if not parent: par = ""
+    par = (
+        "<b>Памятка для родителей:</b> на что смотреть при проверке; что должен проговорить ребёнок; типичные ошибки; мини-тренировка."
+    )
+    if not parent:
+        par = ""
     return f"{base} {form_hint} {sub} {grd} {par}"
 
+
 def _answers_hint(task_lang: str) -> str:
-    if task_lang=="be": return "Адказы — па-беларуску. Тлумачэнне — па-руску."
-    if task_lang=="de": return "Antworten auf Deutsch. Erklärung auf Russisch."
-    if task_lang=="fr": return "Réponses en français. Explication en russe."
-    if task_lang=="en": return "Answers in English. Explanation in Russian."
+    if task_lang == "be":
+        return "Адказы — па-беларуску. Тлумачэнне — па-руску."
+    if task_lang == "de":
+        return "Antworten auf Deutsch. Erklärung auf Russisch."
+    if task_lang == "fr":
+        return "Réponses en français. Explication en russe."
+    if task_lang == "en":
+        return "Answers in English. Explanation in Russian."
     return "Ответы — по-русски. Пояснение — по-русски."
+
 
 # ---------- Классификатор предмета ----------
 async def classify_subject(text: str) -> str:
     try:
         choices = ", ".join(sorted(SUBJECTS - {"auto"}))
-        prompt = ("К какому школьному предмету относится это задание? Выбери РОВНО ОДНО из списка: "
-                  f"{choices}. Если не очевидно — ответь «auto». Только одно слово.\n\n{text[:3000]}")
+        prompt = (
+            "К какому школьному предмету относится это задание? Выбери РОВНО ОДНО из списка: "
+            f"{choices}. Если не очевидно — ответь «auto». Только одно слово.\n\n{text[:3000]}"
+        )
         resp = await client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role":"system","content":"Классификатор. Ответ одним словом из списка или 'auto'."},
-                      {"role":"user","content":prompt}],
-            temperature=0, max_tokens=10
+            messages=[
+                {"role": "system", "content": "Классификатор. Ответ одним словом из списка или 'auto'."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            max_tokens=10,
         )
         ans = (resp.choices[0].message.content or "").strip().lower()
         mapping = {
-            "беларуская мова":"беларуская мова",
-            "беларуская літаратура":"беларуская літаратура",
-            "русский язык":"русский", "литература":"литература",
-            "математика":"математика", "информатика":"информатика", "физика":"физика",
-            "химия":"химия", "история":"история", "обществознание":"обществознание",
-            "биология":"биология", "география":"география", "английский":"английский",
-            "auto":"auto"
+            "беларуская мова": "беларуская мова",
+            "беларуская літаратура": "беларуская літаратура",
+            "русский язык": "русский",
+            "литература": "литература",
+            "математика": "математика",
+            "информатика": "информатика",
+            "физика": "физика",
+            "химия": "химия",
+            "история": "история",
+            "обществознание": "обществознание",
+            "биология": "биология",
+            "география": "география",
+            "английский": "английский",
+            "auto": "auto",
         }
-        for k,v in mapping.items():
-            if ans==k: return v if v in SUBJECTS else "auto"
+        for k, v in mapping.items():
+            if ans == k:
+                return v if v in SUBJECTS else "auto"
         return ans if ans in SUBJECTS else "auto"
     except Exception as e:
         log.warning(f"classify_subject failed: {e}")
         return "auto"
+
 
 # ---------- OCR ----------
 def _preprocess_image(img: Image.Image) -> Image.Image:
@@ -303,16 +404,22 @@ def _preprocess_image(img: Image.Image) -> Image.Image:
     img = ImageEnhance.Sharpness(img).enhance(1.2)
     max_w = 1800
     if img.width < max_w:
-        scale = min(max_w/img.width, 3.0)
-        img = img.resize((int(img.width*scale), int(img.height*scale)), Image.LANCZOS)
+        scale = min(max_w / img.width, 3.0)
+        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
     return img
+
 
 def ocr_image(img: Image.Image) -> str:
     base = ImageOps.exif_transpose(img)
-    langs_chain = [TESS_LANGS, "rus+bel+eng", "rus+eng", "rus", "bel", "eng", "deu", "fra"] if TESS_LANGS else ["rus+bel+eng","rus","eng"]
+    langs_chain = (
+        [TESS_LANGS, "rus+bel+eng", "rus+eng", "rus", "bel", "eng", "deu", "fra"]
+        if TESS_LANGS
+        else ["rus+bel+eng", "rus", "eng"]
+    )
     tried = set()
     for angle in [0, 90, 180, 270]:
-        if angle in tried: continue
+        if angle in tried:
+            continue
         tried.add(angle)
         rot = base.rotate(-angle, expand=True)
         p = _preprocess_image(rot)
@@ -325,9 +432,27 @@ def ocr_image(img: Image.Image) -> str:
                 continue
     return ""
 
+
 # ---------- Гибридный роутер моделей (по умолчанию; заменяется сервисом при наличии) ----------
-HEAVY_MARKERS = ("докажи","обоснуй","подробно","по шагам","поиндукции","уравнение","система","дробь","производная","интеграл","доказать","программа","алгоритм","код")
-def select_model(prompt: str, mode: str) -> tuple[str,int,str]:
+HEAVY_MARKERS = (
+    "докажи",
+    "обоснуй",
+    "подробно",
+    "по шагам",
+    "поиндукции",
+    "уравнение",
+    "система",
+    "дробь",
+    "производная",
+    "интеграл",
+    "доказать",
+    "программа",
+    "алгоритм",
+    "код",
+)
+
+
+def select_model(prompt: str, mode: str) -> tuple[str, int, str]:
     p = (prompt or "").lower()
     if mode == "free":
         return "gpt-4o-mini", 700, "4o-mini"
@@ -339,8 +464,10 @@ def select_model(prompt: str, mode: str) -> tuple[str,int,str]:
         return "o4-mini", 1100, "o4-mini"
     return "gpt-4o-mini", 900, "4o-mini"
 
+
 async def call_model(uid: int, user_text: str, mode: str) -> str:
-    lang = detect_lang(user_text); USER_LANG[uid] = lang
+    lang = detect_lang(user_text)
+    USER_LANG[uid] = lang
     model, max_out, tag = select_model(user_text, mode)
     sys = sys_prompt(uid)
 
@@ -363,8 +490,8 @@ async def call_model(uid: int, user_text: str, mode: str) -> str:
     vdb_context = ""
     if vdb_hints:
         vdb_context = (
-            "\n\n[ВБД-памятка: используй только как справку, не ссылайся на конкретные книги]\n" +
-            "\n".join(vdb_hints)
+            "\n\n[ВБД-памятка: используй только как справку, не ссылайся на конкретные книги]\n"
+            + "\n".join(vdb_hints)
         )
 
     content = (
@@ -375,13 +502,14 @@ async def call_model(uid: int, user_text: str, mode: str) -> str:
     t0 = perf_counter()
     resp = await client.chat.completions.create(
         model=model,
-        messages=[{"role":"system","content":sys},{"role":"user","content":content}],
-        temperature=0.25 if mode in {"free","trial"} else 0.3,
-        max_tokens=max_out
+        messages=[{"role": "system", "content": sys}, {"role": "user", "content": content}],
+        temperature=0.25 if mode in {"free", "trial"} else 0.3,
+        max_tokens=max_out,
     )
     dt = perf_counter() - t0
     log.info(f"LLM model={model} tag={tag} mode={mode} dt={dt:.2f}s")
     return (resp.choices[0].message.content or "").strip()
+
 
 async def call_model_followup(uid: int, prev_task: str, prev_answer: str, follow_q: str, mode_tag: str) -> str:
     """Короткий ответ-уточнение с учётом контекста предыдущего решения."""
@@ -397,13 +525,14 @@ async def call_model_followup(uid: int, prev_task: str, prev_answer: str, follow
     t0 = perf_counter()
     resp = await client.chat.completions.create(
         model=model,
-        messages=[{"role":"system","content":sys},{"role":"user","content":prompt}],
-        temperature=0.25 if mode_tag in {"free","trial"} else 0.3,
-        max_tokens=min(600, max_out)
+        messages=[{"role": "system", "content": sys}, {"role": "user", "content": prompt}],
+        temperature=0.25 if mode_tag in {"free", "trial"} else 0.3,
+        max_tokens=min(600, max_out),
     )
     dt = perf_counter() - t0
     log.info(f"LLM followup model={model} tag={tag} mode={mode_tag} dt={dt:.2f}s")
     return (resp.choices[0].message.content or "").strip()
+
 
 # ---------- (NEW) Единая отправка с обработкой формул ----------
 async def reply_with_formulas(message: Message, raw_text: str, reply_markup=None):
@@ -417,22 +546,53 @@ async def reply_with_formulas(message: Message, raw_text: str, reply_markup=None
         except Exception as e:
             log.warning(f"TEX render fail: {e}")
 
+
 # ---------- Внутренние метрики (в RAM) ----------
 STATS_LOCK = threading.RLock()
+
+
 class UserStats:
-    __slots__ = ("uid","name","username","first_seen","last_seen","kinds","subjects","langs",
-                 "gpt_calls","gpt_time_sum","tok_prompt","tok_completion","ocr_ok","ocr_fail","bytes_images_in")
+    __slots__ = (
+        "uid",
+        "name",
+        "username",
+        "first_seen",
+        "last_seen",
+        "kinds",
+        "subjects",
+        "langs",
+        "gpt_calls",
+        "gpt_time_sum",
+        "tok_prompt",
+        "tok_completion",
+        "ocr_ok",
+        "ocr_fail",
+        "bytes_images_in",
+    )
+
     def __init__(self, uid: int):
-        now=time.time()
-        self.uid=uid; self.name=""; self.username=""
-        self.first_seen=now; self.last_seen=now
-        self.kinds=Counter(); self.subjects=Counter(); self.langs=Counter()
-        self.gpt_calls=0; self.gpt_time_sum=0.0; self.tok_prompt=0; self.tok_completion=0
-        self.ocr_ok=0; self.ocr_fail=0; self.bytes_images_in=0
+        now = time.time()
+        self.uid = uid
+        self.name = ""
+        self.username = ""
+        self.first_seen = now
+        self.last_seen = now
+        self.kinds = Counter()
+        self.subjects = Counter()
+        self.langs = Counter()
+        self.gpt_calls = 0
+        self.gpt_time_sum = 0.0
+        self.tok_prompt = 0
+        self.tok_completion = 0
+        self.ocr_ok = 0
+        self.ocr_fail = 0
+        self.bytes_images_in = 0
+
 
 USERS: dict[int, UserStats] = {}
 
-def _get_user_stats(uid:int, update: Update|None=None) -> UserStats:
+
+def _get_user_stats(uid: int, update: Update | None = None) -> UserStats:
     with STATS_LOCK:
         st = USERS.get(uid) or UserStats(uid)
         USERS[uid] = st
@@ -442,97 +602,154 @@ def _get_user_stats(uid:int, update: Update|None=None) -> UserStats:
             st.username = update.effective_user.username or st.username
         return st
 
+
 def stats_snapshot() -> dict:
     with STATS_LOCK:
         snap_users = {}
-        totals = {"users_count":0,"tasks_total":0,"solve_text":0,"solve_photo":0,"essay":0,
-                  "text_msg":0,"photo_msg":0,"ocr_ok":0,"ocr_fail":0,"gpt_calls":0,"gpt_time_sum":0.0,
-                  "tok_prompt":0,"tok_completion":0,"bytes_images_in":0,"subjects":{},"langs":{}}
-        subjects_acc=Counter(); langs_acc=Counter()
+        totals = {
+            "users_count": 0,
+            "tasks_total": 0,
+            "solve_text": 0,
+            "solve_photo": 0,
+            "essay": 0,
+            "text_msg": 0,
+            "photo_msg": 0,
+            "ocr_ok": 0,
+            "ocr_fail": 0,
+            "gpt_calls": 0,
+            "gpt_time_sum": 0.0,
+            "tok_prompt": 0,
+            "tok_completion": 0,
+            "bytes_images_in": 0,
+            "subjects": {},
+            "langs": {},
+        }
+        subjects_acc = Counter()
+        langs_acc = Counter()
         for uid, st in USERS.items():
-            u={"name":st.name,"username":st.username,"first_seen":st.first_seen,"last_seen":st.last_seen,
-               "kinds":dict(st.kinds),"subjects":dict(st.subjects),"langs":dict(st.langs),
-               "gpt_calls":st.gpt_calls,"gpt_time_sum":st.gpt_time_sum,"tok_prompt":st.tok_prompt,
-               "tok_completion":st.tok_completion,"ocr_ok":st.ocr_ok,"ocr_fail":st.ocr_fail,
-               "bytes_images_in":st.bytes_images_in}
-            snap_users[str(uid)]=u
-            totals["users_count"]+=1
-            totals["solve_text"]+=u["kinds"].get("solve_text",0)
-            totals["solve_photo"]+=u["kinds"].get("solve_photo",0)
-            totals["essay"]+=u["kinds"].get("essay",0)
-            totals["text_msg"]+=u.get("text_msg",0)
-            totals["photo_msg"]+=u.get("photo_msg",0)
-            totals["ocr_ok"]+=u["ocr_ok"]; totals["ocr_fail"]+=u["ocr_fail"]
-            totals["gpt_calls"]+=u["gpt_calls"]; totals["gpt_time_sum"]+=u["gpt_time_sum"]
-            totals["tok_prompt"]+=u["tok_prompt"]; totals["tok_completion"]+=u["tok_completion"]
-            totals["bytes_images_in"]+=u["bytes_images_in"]
-            subjects_acc.update(u["subjects"]); langs_acc.update(u["langs"])
-        totals["tasks_total"]=totals["solve_text"]+totals["solve_photo"]+totals["essay"]
-        totals["subjects"]=dict(subjects_acc); totals["langs"]=dict(langs_acc)
-        return {"generated_at":int(time.time()),"users":snap_users,"totals":totals}
+            u = {
+                "name": st.name,
+                "username": st.username,
+                "first_seen": st.first_seen,
+                "last_seen": st.last_seen,
+                "kinds": dict(st.kinds),
+                "subjects": dict(st.subjects),
+                "langs": dict(st.langs),
+                "gpt_calls": st.gpt_calls,
+                "gpt_time_sum": st.gpt_time_sum,
+                "tok_prompt": st.tok_prompt,
+                "tok_completion": st.tok_completion,
+                "ocr_ok": st.ocr_ok,
+                "ocr_fail": st.ocr_fail,
+                "bytes_images_in": st.bytes_images_in,
+            }
+            snap_users[str(uid)] = u
+            totals["users_count"] += 1
+            totals["solve_text"] += u["kinds"].get("solve_text", 0)
+            totals["solve_photo"] += u["kinds"].get("solve_photo", 0)
+            totals["essay"] += u["kinds"].get("essay", 0)
+            totals["text_msg"] += u.get("text_msg", 0)
+            totals["photo_msg"] += u.get("photo_msg", 0)
+            totals["ocr_ok"] += u["ocr_ok"]
+            totals["ocr_fail"] += u["ocr_fail"]
+            totals["gpt_calls"] += u["gpt_calls"]
+            totals["gpt_time_sum"] += u["gpt_time_sum"]
+            totals["tok_prompt"] += u["tok_prompt"]
+            totals["tok_completion"] += u["tok_completion"]
+            totals["bytes_images_in"] += u["bytes_images_in"]
+            subjects_acc.update(u["subjects"])
+            langs_acc.update(u["langs"])
+        totals["tasks_total"] = totals["solve_text"] + totals["solve_photo"] + totals["essay"]
+        totals["subjects"] = dict(subjects_acc)
+        totals["langs"] = dict(langs_acc)
+        return {"generated_at": int(time.time()), "users": snap_users, "totals": totals}
+
 
 def stats_save():
     os.makedirs(os.path.dirname(METRICS_PATH), exist_ok=True)
     data = json.dumps(stats_snapshot(), ensure_ascii=False, indent=2).encode("utf-8")
-    fd,tmp = tempfile.mkstemp(dir=os.path.dirname(METRICS_PATH), prefix=".metrics.", suffix=".tmp")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(METRICS_PATH), prefix=".metrics.", suffix=".tmp")
     try:
-        with os.fdopen(fd,"wb") as f: f.write(data)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
         os.replace(tmp, METRICS_PATH)
     finally:
         if os.path.exists(tmp):
-            try: os.remove(tmp)
-            except: pass
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
 
 def stats_load():
-    if not os.path.exists(METRICS_PATH): return
+    if not os.path.exists(METRICS_PATH):
+        return
     try:
-        snap = json.load(open(METRICS_PATH,"r",encoding="utf-8"))
-        users = snap.get("users",{})
+        snap = json.load(open(METRICS_PATH, "r", encoding="utf-8"))
+        users = snap.get("users", {})
         with STATS_LOCK:
-            for uid_s,u in users.items():
-                uid=int(uid_s); st=USERS.get(uid) or UserStats(uid)
-                st.name=u.get("name") or st.name; st.username=u.get("username") or st.username
-                st.first_seen=u.get("first_seen", st.first_seen); st.last_seen=u.get("last_seen", st.last_seen)
-                st.kinds=Counter(u.get("kinds",{})); st.subjects=Counter(u.get("subjects",{}))
-                st.langs=Counter(u.get("langs",{})); st.gpt_calls=u.get("gpt_calls",0)
-                st.gpt_time_sum=u.get("gpt_time_sum",0.0); st.tok_prompt=u.get("tok_prompt",0)
-                st.tok_completion=u.get("tok_completion",0); st.ocr_ok=u.get("ocr_ok",0)
-                st.ocr_fail=u.get("ocr_fail",0); st.bytes_images_in=u.get("bytes_images_in",0)
-                USERS[uid]=st
+            for uid_s, u in users.items():
+                uid = int(uid_s)
+                st = USERS.get(uid) or UserStats(uid)
+                st.name = u.get("name") or st.name
+                st.username = u.get("username") or st.username
+                st.first_seen = u.get("first_seen", st.first_seen)
+                st.last_seen = u.get("last_seen", st.last_seen)
+                st.kinds = Counter(u.get("kinds", {}))
+                st.subjects = Counter(u.get("subjects", {}))
+                st.langs = Counter(u.get("langs", {}))
+                st.gpt_calls = u.get("gpt_calls", 0)
+                st.gpt_time_sum = u.get("gpt_time_sum", 0.0)
+                st.tok_prompt = u.get("tok_prompt", 0)
+                st.tok_completion = u.get("tok_completion", 0)
+                st.ocr_ok = u.get("ocr_ok", 0)
+                st.ocr_fail = u.get("ocr_fail", 0)
+                st.bytes_images_in = u.get("bytes_images_in", 0)
+                USERS[uid] = st
         log.info(f"Loaded metrics (users={len(USERS)})")
     except Exception as e:
         log.warning(f"stats_load failed: {e}")
 
+
 def _stats_autosave_loop():
-    interval=max(10, METRICS_AUTOSAVE_SEC)
+    interval = max(10, METRICS_AUTOSAVE_SEC)
     log.info(f"Metrics autosave every {interval}s -> {METRICS_PATH}")
     while True:
-        try: stats_save()
-        except Exception as e: log.warning(f"stats_save failed: {e}")
+        try:
+            stats_save()
+        except Exception as e:
+            log.warning(f"stats_save failed: {e}")
         time.sleep(interval)
+
 
 # ---------- Команды ----------
 async def set_commands(app: Application):
-    await app.bot.set_my_commands([
-        BotCommand("start","Запуск"),
-        BotCommand("menu","Меню"),
-        BotCommand("help","Помощь"),
-        BotCommand("about","О боте"),
-        BotCommand("subject","Предмет (или auto)"),
-        BotCommand("grade","Класс 5–11"),
-        BotCommand("parent","Режим родителей on/off"),
-        BotCommand("mystats","Моя статистика"),
-        BotCommand("stats","Статистика (админ)"),
-        BotCommand("buy","Купить Pro/кредиты"),
-        BotCommand("explain","Объяснить: /explain ТЕКСТ"),
-        BotCommand("essay","Сочинение: /essay ТЕМА"),
-        BotCommand("vdbtest","Проверить поиск в ВБД (админ)"),
-        BotCommand("whoami","Показать мой Telegram ID"),
-    ])
+    await app.bot.set_my_commands(
+        [
+            BotCommand("start", "Запуск"),
+            BotCommand("menu", "Меню"),
+            BotCommand("help", "Помощь"),
+            BotCommand("about", "О боте"),
+            BotCommand("subject", "Предмет (или auto)"),
+            BotCommand("grade", "Класс 5–11"),
+            BotCommand("parent", "Режим родителей on/off"),
+            BotCommand("mystats", "Моя статистика"),
+            BotCommand("stats", "Статистика (админ)"),
+            BotCommand("buy", "Купить Pro/кредиты"),
+            BotCommand("explain", "Объяснить: /explain ТЕКСТ"),
+            BotCommand("essay", "Сочинение: /essay ТЕМА"),
+            BotCommand("vdbtest", "Проверить поиск в ВБД (админ)"),
+            BotCommand("whoami", "Показать мой Telegram ID"),
+        ]
+    )
+
 
 async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    await update.message.reply_text(f"Твой Telegram ID: <code>{uid}</code>", parse_mode="HTML", reply_markup=kb(uid))
+    await update.message.reply_text(
+        f"Твой Telegram ID: <code>{uid}</code>", parse_mode="HTML", reply_markup=kb(uid)
+    )
+
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -543,11 +760,13 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Free: 3 запроса/день (текст, GPT-4o-mini) + 1 «Пробный Pro»/день.\n"
         "Pro: месячный лимит (жёсткий), приоритет, сложные задачи на o4-mini/4o.\n\n"
         "Пиши задание или жми кнопки ниже.",
-        reply_markup=kb(uid)
+        reply_markup=kb(uid),
     )
+
 
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_cmd(update, context)
+
 
 async def about_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply_html(
@@ -557,35 +776,44 @@ async def about_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Free: 3/день (текст) + 1 Trial Pro/день.\n"
         "• Pro: больше лимитов и приоритет; тяжёлые задачи → o4-mini/4o.\n"
         "• Оплата: Telegram Stars / Карта РБ / ЕРИП.",
-        reply_markup=kb(update.effective_user.id)
+        reply_markup=kb(update.effective_user.id),
     )
+
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await about_cmd(update, context)
 
+
 async def subject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid=update.effective_user.id
+    uid = update.effective_user.id
     if not context.args:
         return await update.message.reply_text("Доступно: " + ", ".join(sorted(SUBJECTS)), reply_markup=kb(uid))
-    val=" ".join(context.args).strip().lower()
+    val = " ".join(context.args).strip().lower()
     if val not in SUBJECTS:
-        return await update.message.reply_text("Не понял предмет. Доступно: " + ", ".join(sorted(SUBJECTS)), reply_markup=kb(uid))
-    USER_SUBJECT[uid]=val
+        return await update.message.reply_text(
+            "Не понял предмет. Доступно: " + ", ".join(sorted(SUBJECTS)), reply_markup=kb(uid)
+        )
+    USER_SUBJECT[uid] = val
     await update.message.reply_text(f"Предмет: {val}", reply_markup=kb(uid))
 
+
 async def grade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid=update.effective_user.id
-    if not context.args or context.args[0] not in [str(i) for i in range(5,12)]:
+    uid = update.effective_user.id
+    if not context.args or context.args[0] not in [str(i) for i in range(5, 12)]:
         return await update.message.reply_text("Пример: /grade 7", reply_markup=kb(uid))
-    USER_GRADE[uid]=context.args[0]
+    USER_GRADE[uid] = context.args[0]
     await update.message.reply_text(f"Класс: {USER_GRADE[uid]}", reply_markup=kb(uid))
 
+
 async def parent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid=update.effective_user.id
-    if not context.args or context.args[0].lower() not in {"on","off"}:
+    uid = update.effective_user.id
+    if not context.args or context.args[0].lower() not in {"on", "off"}:
         return await update.message.reply_text("Используй: /parent on  или  /parent off", reply_markup=kb(uid))
-    PARENT_MODE[uid]=(context.args[0].lower()=="on")
-    await update.message.reply_text(f"Режим для родителей: {'вкл' if PARENT_MODE[uid] else 'выкл'}", reply_markup=kb(uid))
+    PARENT_MODE[uid] = context.args[0].lower() == "on"
+    await update.message.reply_text(
+        f"Режим для родителей: {'вкл' if PARENT_MODE[uid] else 'выкл'}", reply_markup=kb(uid)
+    )
+
 
 # === Импорт сервисов (лимиты/платежи/роутер моделей) ===
 # Порядок: services/* -> корневые модули (fallback).
@@ -604,6 +832,7 @@ try:
         get_stars_amount as _get_stars_amount_ext,  # опционально
     )
     from services.router import select_model as _select_model_ext
+
     # если сервис роутера есть — подменим локальную эвристику
     if _select_model_ext:  # type: ignore
         select_model = _select_model_ext  # type: ignore
@@ -614,23 +843,29 @@ except Exception as e:
         import usage as _u
         import payments as _p
         import router as _r
-        consume_request        = _u.consume_request
-        my_stats               = _u.my_stats
-        daily_summary          = getattr(_u, "daily_summary", None) or (lambda: {"day":0,"dau":0,"free_total":0,"paid":0,"credit":0,"sub":0})
-        get_user_plan          = _u.get_user_plan
-        add_credits            = _u.add_credits
-        activate_sub           = _u.activate_sub
-        build_buy_keyboard     = _p.build_buy_keyboard
-        apply_payment_payload  = _p.apply_payment_payload
+
+        consume_request = _u.consume_request
+        my_stats = _u.my_stats
+        daily_summary = getattr(_u, "daily_summary", None) or (
+            lambda: {"day": 0, "dau": 0, "free_total": 0, "paid": 0, "credit": 0, "sub": 0}
+        )
+        get_user_plan = _u.get_user_plan
+        add_credits = _u.add_credits
+        activate_sub = _u.activate_sub
+        build_buy_keyboard = _p.build_buy_keyboard
+        apply_payment_payload = _p.apply_payment_payload
         try:
-            select_model       = _r.select_model  # noqa: F401
+            select_model = _r.select_model  # noqa: F401
         except Exception:
             pass
         _get_stars_amount_ext = getattr(_p, "get_stars_amount", None)
         log.info("root modules connected")
     except Exception as e2:
         log.error(f"usage/payments/router not available: {e2}")
-        raise SystemExit("Критично: нет модулей лимитов/оплат. Проверь services/usage.py, services/payments.py, services/router.py")
+        raise SystemExit(
+            "Критично: нет модулей лимитов/оплат. Проверь services/usage.py, services/payments.py, services/router.py"
+        )
+
 
 def _stars_amount(payload: str) -> int:
     # отдаём сервису, если он есть; иначе — окружение/дефолты
@@ -640,12 +875,13 @@ def _stars_amount(payload: str) -> int:
         except Exception:
             pass
     defaults = {
-        "CREDITS_50":   int(os.getenv("PRICE_CREDITS_50_XTR",  "60")),
-        "CREDITS_200":  int(os.getenv("PRICE_CREDITS_200_XTR", "220")),
-        "CREDITS_1000": int(os.getenv("PRICE_CREDITS_1000_XTR","990")),
-        "SUB_MONTH":    int(os.getenv("PRICE_SUB_MONTH_XTR",   "490")),
+        "CREDITS_50": int(os.getenv("PRICE_CREDITS_50_XTR", "60")),
+        "CREDITS_200": int(os.getenv("PRICE_CREDITS_200_XTR", "220")),
+        "CREDITS_1000": int(os.getenv("PRICE_CREDITS_1000_XTR", "990")),
+        "SUB_MONTH": int(os.getenv("PRICE_SUB_MONTH_XTR", "490")),
     }
     return defaults.get(payload, 100)
+
 
 async def free_vs_pro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -659,13 +895,15 @@ async def free_vs_pro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await safe_reply_html(update.message, msg, reply_markup=kb(uid))
 
+
 async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb_i = build_buy_keyboard(
         stars_enabled=TELEGRAM_STARS_ENABLED and (TELEGRAM_PROVIDER_TOKEN == ""),
         card_url=CARD_CHECKOUT_URL or None,
-        erip_url=ERIP_CHECKOUT_URL or None
+        erip_url=ERIP_CHECKOUT_URL or None,
     )
     await update.message.reply_text("Выбери способ оплаты:", reply_markup=kb_i)
+
 
 # ---------- Основные действия ----------
 async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -673,16 +911,20 @@ async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args).strip() if context.args else (update.message.text or "").strip()
     if not text:
         USER_STATE[uid] = "AWAIT_EXPLAIN"
-        return await update.message.reply_text("🧠 Что объяснить/решить? Напиши одной фразой.", reply_markup=kb(uid))
+        return await update.message.reply_text(
+            "🧠 Что объяснить/решить? Напиши одной фразой.", reply_markup=kb(uid)
+        )
 
     ok, mode, reason = consume_request(uid, need_pro=False, allow_trial=True)
     if not ok:
         kb_i = build_buy_keyboard(
             stars_enabled=TELEGRAM_STARS_ENABLED and (TELEGRAM_PROVIDER_TOKEN == ""),
             card_url=CARD_CHECKOUT_URL or None,
-            erip_url=ERIP_CHECKOUT_URL or None
+            erip_url=ERIP_CHECKOUT_URL or None,
         )
-        return await update.message.reply_text(f"Лимит исчерпан ({reason}). Оформи Pro или купи кредиты:", reply_markup=kb_i)
+        return await update.message.reply_text(
+            f"Лимит исчерпан ({reason}). Оформи Pro или купи кредиты:", reply_markup=kb_i
+        )
 
     if USER_SUBJECT[uid] == "auto":
         subj = await classify_subject(text)
@@ -700,7 +942,7 @@ async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Нужно что-то уточнить по решению?\n"
             "ℹ️ <b>1 уточнение — бесплатно в течение 15 минут</b>. Дальше уточнения будут списывать лимит/кредит.",
-            reply_markup=keyboard
+            reply_markup=keyboard,
         )
         USER_STATE[uid] = "AWAIT_FOLLOWUP_YN"
     except Exception as e:
@@ -708,6 +950,7 @@ async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=kb(uid))
     finally:
         await spinner_finish()
+
 
 async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -721,9 +964,11 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb_i = build_buy_keyboard(
             stars_enabled=TELEGRAM_STARS_ENABLED and (TELEGRAM_PROVIDER_TOKEN == ""),
             card_url=CARD_CHECKOUT_URL or None,
-            erip_url=ERIP_CHECKOUT_URL or None
+            erip_url=ERIP_CHECKOUT_URL or None,
         )
-        return await update.message.reply_text(f"Лимит исчерпан ({reason}). Оформи Pro или купи кредиты:", reply_markup=kb_i)
+        return await update.message.reply_text(
+            f"Лимит исчерпан ({reason}). Оформи Pro или купи кредиты:", reply_markup=kb_i
+        )
 
     spinner_finish, spinner_set = await start_spinner(update, context, "Готовлю сочинение…")
     try:
@@ -736,13 +981,14 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Нужно что-то уточнить/сократить/перефразировать?\n"
             "ℹ️ <b>1 уточнение — бесплатно в течение 15 минут</b>. Дальше — списание лимита/кредита.",
-            reply_markup=keyboard
+            reply_markup=keyboard,
         )
     except Exception as e:
         log.exception("essay")
         await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=kb(uid))
     finally:
         await spinner_finish()
+
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -751,9 +997,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb_i = build_buy_keyboard(
             stars_enabled=TELEGRAM_STARS_ENABLED and (TELEGRAM_PROVIDER_TOKEN == ""),
             card_url=CARD_CHECKOUT_URL or None,
-            erip_url=ERIP_CHECKOUT_URL or None
+            erip_url=ERIP_CHECKOUT_URL or None,
         )
-        return await update.message.reply_text("Фото-решение доступно в Pro/Trial/кредитах. Выбери оплату:", reply_markup=kb_i)
+        return await update.message.reply_text(
+            "Фото-решение доступно в Pro/Trial/кредитах. Выбери оплату:", reply_markup=kb_i
+        )
 
     spinner_finish, spinner_set = await start_spinner(update, context, "Обрабатываю фото…")
     try:
@@ -771,7 +1019,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         spinner_set("Распознаю текст…")
         ocr_text = ocr_image(img)
         if not ocr_text.strip():
-            return await update.message.reply_text("Не удалось распознать текст. Попробуй переснять или напиши текстом.", reply_markup=kb(uid))
+            return await update.message.reply_text(
+                "Не удалось распознать текст. Попробуй переснять или напиши текстом.", reply_markup=kb(uid)
+            )
 
         if USER_SUBJECT[uid] == "auto":
             subj = await classify_subject(ocr_text)
@@ -788,15 +1038,20 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Нужно уточнение к решению?\n"
             "ℹ️ <b>1 уточнение — бесплатно в течение 15 минут</b>. Следующие — со списанием.",
-            reply_markup=keyboard
+            reply_markup=keyboard,
         )
     except Exception as e:
         log.exception("photo")
-        keyboard = ReplyKeyboardMarkup([["📸 Решить по фото", "✍️ Напишу текстом"]], resize_keyboard=True, one_time_keyboard=True)
-        await update.message.reply_text("Не получилось обработать фото. Попробуй ещё раз или напиши текстом:", reply_markup=keyboard)
+        keyboard = ReplyKeyboardMarkup(
+            [["📸 Решить по фото", "✍️ Напишу текстом"]], resize_keyboard=True, one_time_keyboard=True
+        )
+        await update.message.reply_text(
+            "Не получилось обработать фото. Попробуй ещё раз или напиши текстом:", reply_markup=keyboard
+        )
         USER_STATE[uid] = "AWAIT_TEXT_OR_PHOTO_CHOICE"
     finally:
         await spinner_finish()
+
 
 # ---------- Тексты и кнопки ----------
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -819,9 +1074,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb_i = build_buy_keyboard(
                 stars_enabled=TELEGRAM_STARS_ENABLED and (TELEGRAM_PROVIDER_TOKEN == ""),
                 card_url=CARD_CHECKOUT_URL or None,
-                erip_url=ERIP_CHECKOUT_URL or None
+                erip_url=ERIP_CHECKOUT_URL or None,
             )
-            return await update.message.reply_text("Trial уже использован. Доступны подписка или кредиты:", reply_markup=kb_i)
+            return await update.message.reply_text(
+                "Trial уже использован. Доступны подписка или кредиты:", reply_markup=kb_i
+            )
         PRO_NEXT[uid] = True
         return await update.message.reply_text("Режим Pro включён для следующего запроса.", reply_markup=kb(uid))
 
@@ -840,9 +1097,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ctx = get_followup_context(uid)
             window_ok = in_free_window(ctx) and not (ctx or {}).get("used_free", False)
             USER_STATE[uid] = "AWAIT_FOLLOWUP_FREE" if window_ok else "AWAIT_FOLLOWUP_PAID"
-            warn = ("ℹ️ Это уточнение бесплатно (в пределах 15 минут). Напиши, что именно уточнить."
-                    if window_ok else
-                    "⚠️ Следующее уточнение спишет лимит/кредит. Напиши вопрос — и я продолжу по текущему решению.")
+            warn = (
+                "ℹ️ Это уточнение бесплатно (в пределах 15 минут). Напиши, что именно уточнить."
+                if window_ok
+                else "⚠️ Следующее уточнение спишет лимит/кредит. Напиши вопрос — и я продолжу по текущему решению."
+            )
             return await update.message.reply_text(warn)
         if txt == "нет":
             USER_STATE[uid] = None
@@ -862,8 +1121,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mark_followup_used(uid)
             keyboard = ReplyKeyboardMarkup([["Да", "Нет"]], resize_keyboard=True, one_time_keyboard=True)
             await update.message.reply_text(
-                "Нужно ещё уточнение?\n⚠️ Дальше уточнения будут списывать лимит/кредит.",
-                reply_markup=keyboard
+                "Нужно ещё уточнение?\n⚠️ Дальше уточнения будут списывать лимит/кредит.", reply_markup=keyboard
             )
             return
 
@@ -875,17 +1133,21 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb_i = build_buy_keyboard(
                 stars_enabled=TELEGRAM_STARS_ENABLED and (TELEGRAM_PROVIDER_TOKEN == ""),
                 card_url=CARD_CHECKOUT_URL or None,
-                erip_url=ERIP_CHECKOUT_URL or None
+                erip_url=ERIP_CHECKOUT_URL or None,
             )
             USER_STATE[uid] = None
-            return await update.message.reply_text(f"Нужно списание ({reason}). Оформи Pro/Trial или купи кредиты:", reply_markup=kb_i)
-        prev_task = (ctx or {}).get("task","")
-        prev_ans  = (ctx or {}).get("answer","")
+            return await update.message.reply_text(
+                f"Нужно списание ({reason}). Оформи Pro/Trial или купи кредиты:", reply_markup=kb_i
+            )
+        prev_task = (ctx or {}).get("task", "")
+        prev_ans = (ctx or {}).get("answer", "")
         out = await call_model_followup(uid, prev_task or raw, prev_ans, raw, mode_tag=mode)
         await reply_with_formulas(update.message, out, reply_markup=kb(uid))
         USER_STATE[uid] = "AWAIT_FOLLOWUP_NEXT"
         keyboard = ReplyKeyboardMarkup([["Да", "Нет"]], resize_keyboard=True, one_time_keyboard=True)
-        await update.message.reply_text("Ещё вопрос по этой задаче? ⚠️ Будет списание лимита/кредита.", reply_markup=keyboard)
+        await update.message.reply_text(
+            "Ещё вопрос по этой задаче? ⚠️ Будет списание лимита/кредита.", reply_markup=keyboard
+        )
         return
 
     if txt == "🧠 объяснить":
@@ -918,14 +1180,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb_i = build_buy_keyboard(
                 stars_enabled=TELEGRAM_STARS_ENABLED and (TELEGRAM_PROVIDER_TOKEN == ""),
                 card_url=CARD_CHECKOUT_URL or None,
-                erip_url=ERIP_CHECKOUT_URL or None
+                erip_url=ERIP_CHECKOUT_URL or None,
             )
-            return await update.message.reply_text(f"Pro недоступен ({reason}). Выбери оплату:", reply_markup=kb_i)
+            return await update.message.reply_text(
+                f"Pro недоступен ({reason}). Выбери оплату:", reply_markup=kb_i
+            )
         context.args = [raw]
         return await explain_cmd(update, context)
 
     context.args = [raw]
     return await explain_cmd(update, context)
+
 
 # ---------- Статистика / админ ----------
 async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -935,11 +1200,12 @@ async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Сегодня: free {s['today']['free']}, trial {s['today']['trial']}, credit {s['today']['credit']}, sub {s['today']['sub']}\n"
         f"7 дней:  free {s['last7']['free']}, trial {s['last7']['trial']}, credit {s['last7']['credit']}, sub {s['last7']['sub']}\n"
         f"30 дней: free {s['last30']['free']}, trial {s['last30']['trial']}, credit {s['last30']['credit']}, sub {s['last30']['sub']}",
-        reply_markup=kb(uid)
+        reply_markup=kb(uid),
     )
 
+
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in [int(x) for x in os.getenv("ADMIN_IDS","").split(",") if x.strip().isdigit()]:
+    if update.effective_user.id not in [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]:
         return await update.message.reply_text("Недостаточно прав.")
     s = daily_summary()
     await update.message.reply_text(
@@ -948,32 +1214,38 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"(credit={s['credit']}, sub={s['sub']})"
     )
 
+
 # ---------- ВБД: тестовый поиск (админ) ----------
 async def vdbtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in [int(x) for x in os.getenv("ADMIN_IDS","").split(",") if x.strip().isdigit()]:
+    if update.effective_user.id not in [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]:
         return await update.message.reply_text("Недостаточно прав.")
     q = " ".join(context.args).strip() if context.args else ""
     if not q:
         return await update.message.reply_text("Использование: /vdbtest запрос...  (исп-ся текущие Предмет/Класс)")
     subj_key = subject_to_vdb_key(USER_SUBJECT[update.effective_user.id])
-    grade_int = int(USER_GRADE[update.effective_user.id]) if str(USER_GRADE[update.effective_user.id]).isdigit() else 8
+    grade_int = (
+        int(USER_GRADE[update.effective_user.id]) if str(USER_GRADE[update.effective_user.id]).isdigit() else 8
+    )
     try:
         rules = await search_rules(client, clamp_words(q, 40), subj_key, grade_int, top_k=5)
         if not rules and subj_key != USER_SUBJECT[update.effective_user.id]:
-            rules = await search_rules(client, clamp_words(q, 40), USER_SUBJECT[update.effective_user.id], grade_int, top_k=5)
+            rules = await search_rules(
+                client, clamp_words(q, 40), USER_SUBJECT[update.effective_user.id], grade_int, top_k=5
+            )
         if not rules:
             return await update.message.reply_text("⚠️ Ничего не нашёл в ВБД по этому запросу.")
         lines = []
         for r in rules:
             book = r.get("book") or ""
-            ch   = r.get("chapter") or ""
-            pg   = r.get("page")
-            brief= r.get("rule_brief") or ""
+            ch = r.get("chapter") or ""
+            pg = r.get("page")
+            brief = r.get("rule_brief") or ""
             meta = " · ".join([x for x in [book, ch, f"стр. {pg}" if pg else ""] if x])
             lines.append(("— " + brief) + (f"\n   ({meta})" if meta else ""))
         await update.message.reply_text("\n".join(lines[:5])[:3500])
     except Exception as e:
         await update.message.reply_text(f"Ошибка ВБД: {e}")
+
 
 # ---------- Callbacks / Telegram Payments ----------
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -996,21 +1268,28 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             currency="XTR",
             prices=[LabeledPrice("Услуга", amount)],
             start_parameter="gotovo",
-            is_flexible=False
+            is_flexible=False,
         )
         return await q.edit_message_text("Открыл счёт в Telegram. Заверши оплату, пожалуйста.")
     return None
+
 
 async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query: PreCheckoutQuery = update.pre_checkout_query
     await query.answer(ok=True)
 
+
 async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    payload = update.message.successful_payment.invoice_payload if update.message and update.message.successful_payment else None
+    payload = (
+        update.message.successful_payment.invoice_payload
+        if update.message and update.message.successful_payment
+        else None
+    )
     if payload:
         msg = apply_payment_payload(uid, payload)
         await update.message.reply_text(msg + "\nПроверить баланс: /mystats")
+
 
 # ---------- Health + webhooks (карта/ЕРИП) + VDB upsert ----------
 class _Health(BaseHTTPRequestHandler):
@@ -1042,15 +1321,15 @@ class _Health(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            length = int(self.headers.get("Content-Length","0"))
-            raw = self.rfile.read(length) if length>0 else b"{}"
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length > 0 else b"{}"
             data = json.loads(raw.decode("utf-8") or "{}")
-            auth = self.headers.get("X-Auth","")
+            auth = self.headers.get("X-Auth", "")
 
             if self.path == "/webhook/card":
                 if auth != CARD_WEBHOOK_SECRET or not CARD_WEBHOOK_SECRET:
                     return self._err(401, "bad auth")
-                uid = int(data.get("user_id",0) or 0)
+                uid = int(data.get("user_id", 0) or 0)
                 kind = data.get("kind")
                 if not uid or not kind:
                     return self._err(400, "bad payload")
@@ -1060,7 +1339,7 @@ class _Health(BaseHTTPRequestHandler):
             if self.path == "/webhook/erip":
                 if auth != ERIP_WEBHOOK_SECRET or not ERIP_WEBHOOK_SECRET:
                     return self._err(401, "bad auth")
-                uid = int(data.get("user_id",0) or 0)
+                uid = int(data.get("user_id", 0) or 0)
                 kind = data.get("kind")
                 if not uid or not kind:
                     return self._err(400, "bad payload")
@@ -1072,23 +1351,29 @@ class _Health(BaseHTTPRequestHandler):
                     return self._err(401, "bad auth")
                 rules = data.get("rules") or []
                 try:
-        # Если список пуст — не трогаем OpenAI/ВБД, просто отвечаем ок
+                    # Если список пуст — не трогаем OpenAI/ВБД, просто отвечаем ок
                     if not rules:
                         return self._ok(b"VDB upsert ok (0)")
                     from rag_vdb import upsert_rules
                     asyncio.run(upsert_rules(client, rules))
                     return self._ok(b"VDB upsert ok")
-               except Exception as e:
+                except Exception as e:
                     return self._err(500, f"upsert failed: {e}")
+
+            return self._err(404, "not found")
+        except Exception as e:
+            return self._err(500, f"error: {e}")
 
 
 def _run_health():
     HTTPServer(("0.0.0.0", PORT), _Health).serve_forever()
 
+
 # ---------- MAIN ----------
 class _HealthThread(threading.Thread):
     def run(self):
         _run_health()
+
 
 def main():
     try:
@@ -1120,12 +1405,12 @@ def main():
     app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
     app.add_handler(MessageHandler(f.SUCCESSFUL_PAYMENT, successful_payment_handler))
 
-
     app.add_handler(MessageHandler(f.PHOTO | f.Document.IMAGE, handle_photo))
     app.add_handler(MessageHandler(f.TEXT & ~f.COMMAND, on_text))
 
     log.info("Gotovo R1+VDB running…")
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
