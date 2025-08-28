@@ -30,7 +30,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, CallbackQueryHandler,
     PreCheckoutQueryHandler, filters as f
 )
-from telegram.ext.filters import StatusUpdate
+
 from openai import AsyncOpenAI
 
 from PIL import Image, ImageOps, ImageFilter, ImageEnhance
@@ -1118,7 +1118,8 @@ def main():
 
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
-    app.add_handler(MessageHandler(StatusUpdate.SUCCESSFUL, successful_payment_handler))
+    app.add_handler(MessageHandler(f.SUCCESSFUL_PAYMENT, successful_payment_handler))
+
 
     app.add_handler(MessageHandler(f.PHOTO | f.Document.IMAGE, handle_photo))
     app.add_handler(MessageHandler(f.TEXT & ~f.COMMAND, on_text))
