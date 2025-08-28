@@ -49,47 +49,14 @@ def apply_payment_payload(user_id: int, payload: str) -> str:
         return "Подписка Pro активирована на 31 день."
     return "Платёж зачтён."
 
-diff --git a/services/payments.py b/services/payments.py
-index 65eed9f340ab2749b327c520280de26319b6d624..0678ad34d1a6569f1f6d61727e925321cbfeed8d 100644
---- a/services/payments.py
-+++ b/services/payments.py
-@@ -26,25 +26,38 @@ def build_buy_keyboard(stars_enabled: bool, card_url: Optional[str], erip_url: O
-             btns.append(InlineKeyboardButton(f"💳 {title} · {price_card}", url=card_url))
-         if erip_url:
-             btns.append(InlineKeyboardButton(f"ЕРИП {title}", url=erip_url))
-         rows.append(btns)
-     # Подписка
-     for pid, title, price_card, price_stars in BUY_PRESETS["subs"]:
-         btns = []
-         if stars_enabled:
-             btns.append(InlineKeyboardButton(f"⭐ {title} · {price_stars}", callback_data=f"buy_stars:{pid}"))
-         if card_url:
-             btns.append(InlineKeyboardButton(f"💳 {title} · {price_card}", url=card_url))
-         if erip_url:
-             btns.append(InlineKeyboardButton(f"ЕРИП {title}", url=erip_url))
-         rows.append(btns)
-     return InlineKeyboardMarkup(rows)
- 
- def apply_payment_payload(user_id: int, payload: str) -> str:
-     if payload.startswith("CREDITS_"):
-         n = int(payload.split("_")[1])
-         add_credits(user_id, n)
-         return f"Зачислено {n} кредитов."
-     if payload == "SUB_MONTH":
-         activate_sub(user_id, 31)
-         return "Подписка Pro активирована на 31 день."
-     return "Платёж зачтён."
-+
-+
-+def get_stars_amount(payload: str) -> int:
-+    """Вернуть стоимость товара в Stars по идентификатору payload."""
-+    if payload.startswith("CREDITS_"):
-+        for pid, _, _, price_stars in BUY_PRESETS["credits"]:
-+            if pid == payload:
-+                return int(price_stars.split()[0]) * 10
-+    if payload.startswith("SUB_"):
-+        for pid, _, _, price_stars in BUY_PRESETS["subs"]:
-+            if pid == payload:
-+                return int(price_stars.split()[0]) * 10
-+    raise ValueError("Unknown payload")
-
+def get_stars_amount(payload: str) -> int:
+    """Вернуть стоимость товара в Stars по идентификатору payload."""
+    if payload.startswith("CREDITS_"):
+        for pid, _, _, price_stars in BUY_PRESETS["credits"]:
+            if pid == payload:
+                return int(price_stars.split()[0]) * 10
+    if payload.startswith("SUB_"):
+        for pid, _, _, price_stars in BUY_PRESETS["subs"]:
+            if pid == payload:
+                return int(price_stars.split()[0]) * 10
+    raise ValueError("Unknown payload")
