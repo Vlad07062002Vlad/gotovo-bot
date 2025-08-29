@@ -1,4 +1,4 @@
-# bot.py — R1+VDB: монетизация + статистика + гибридные модели (4o-mini / o4-mini / 4o) + ВБД (Qdrant RAG)
+# bot.py — R1+VDB: монетизация + статистика + гибридные модели (4o-mini / o4-mini / 4o) + ВБД (Qdrant RAG) + АДМИНКА
 # Регион: Беларусь. Оплаты: Telegram Stars / Карта РБ / ЕРИП.
 # + Follow-up: 1 бесплатное уточнение с контекстом (15 минут), затем — списание.
 
@@ -103,6 +103,43 @@ def _now_day_ym():
     ym = time.strftime("%Y%m", time.gmtime(now))
     return now, day, ym
 
+# ---------- Админы (RBAC ENV + DB) ----------
+def _db_admins():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS admin_users(
+            user_id INTEGER PRIMARY KEY,
+            added_ts INTEGER
+        )"""
+    )
+    return conn
+
+def _env_admin_ids() -> set[int]:
+    return {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+
+def _load_admins_from_db() -> set[int]:
+    with _db_admins() as db:
+        rows = db.execute("SELECT user_id FROM admin_users").fetchall()
+    return {int(r[0]) for r in rows}
+
+def all_admin_ids() -> set[int]:
+    return _env_admin_ids() | _load_admins_from_db()
+
+def is_admin(uid: int) -> bool:
+    return uid in all_admin_ids()
+
+def add_admin(uid: int) -> bool:
+    if not isinstance(uid, int) or uid <= 0:
+        return False
+    with _db_admins() as db:
+        db.execute("INSERT OR IGNORE INTO admin_users(user_id, added_ts) VALUES(?,?)", (uid, int(time.time())))
+    return True
+
+def del_admin(uid: int) -> bool:
+    with _db_admins() as db:
+        db.execute("DELETE FROM admin_users WHERE user_id=?", (uid,))
+    return True
 
 # ---------- ПАМЯТЬ (RAM) ----------
 SUBJECTS = {
@@ -137,11 +174,9 @@ SUBJECT_VDB_KEY = {
     "беларуская літаратура": "bel_lit",
 }
 
-
 def subject_to_vdb_key(s: str) -> str:
     s = (s or "").strip().lower()
     return SUBJECT_VDB_KEY.get(s, s)
-
 
 USER_SUBJECT = defaultdict(lambda: "auto")
 USER_GRADE = defaultdict(lambda: "8")
@@ -152,7 +187,6 @@ PRO_NEXT = defaultdict(lambda: False)
 
 # ---- Follow-up контекст (1 бесплатное уточнение, 15 минут)
 FOLLOWUP_FREE_WINDOW_SEC = 15 * 60
-
 
 def set_followup_context(uid: int, task_text: str, answer_text: str):
     snippet_task = (task_text or "").strip()[:1200]
@@ -171,7 +205,6 @@ def set_followup_context(uid: int, task_text: str, answer_text: str):
             (uid, snippet_task, snippet_ans, now, snippet_task, snippet_ans, now),
         )
 
-
 def get_followup_context(uid: int):
     with _db_followup() as db:
         row = db.execute(
@@ -187,17 +220,14 @@ def get_followup_context(uid: int):
         "used_free": bool(row[3]),
     }
 
-
 def mark_followup_used(uid: int):
     with _db_followup() as db:
         db.execute("UPDATE followup_state SET used_free=1 WHERE user_id=?", (uid,))
-
 
 def in_free_window(ctx: dict | None) -> bool:
     if not ctx:
         return False
     return int(time.time()) - int(ctx.get("ts", 0)) <= FOLLOWUP_FREE_WINDOW_SEC
-
 
 # ---------- Клавиатура ----------
 def kb(uid: int) -> ReplyKeyboardMarkup:
@@ -214,12 +244,10 @@ def kb(uid: int) -> ReplyKeyboardMarkup:
         resize_keyboard=True,
     )
 
-
 # ---------- Безопасный HTML ----------
 ALLOWED_TAGS = {"b", "i", "code", "pre"}
 _TAG_OPEN = {t: f"&lt;{t}&gt;" for t in ALLOWED_TAGS}
 _TAG_CLOSE = {t: f"&lt;/{t}&gt;" for t in ALLOWED_TAGS}
-
 
 def sanitize_html(text: str) -> str:
     if not text:
@@ -236,7 +264,6 @@ def sanitize_html(text: str) -> str:
         )
     return esc[:4000]
 
-
 async def safe_reply_html(message: Message, text: str, **kwargs):
     try:
         return await message.reply_text(
@@ -248,7 +275,6 @@ async def safe_reply_html(message: Message, text: str, **kwargs):
                 html.escape(text)[:4000], disable_web_page_preview=True, **kwargs
             )
         raise
-
 
 # ---------- Спиннер ----------
 async def start_spinner(
@@ -291,7 +317,6 @@ async def start_spinner(
 
     return finish, set_label
 
-
 # ---------- Детект языка ----------
 def detect_lang(text: str) -> str:
     tl = (text or "").lower()
@@ -306,7 +331,6 @@ def detect_lang(text: str) -> str:
     if lat > cyr * 1.2:
         return "en"
     return "ru"
-
 
 # ---------- Системный промпт ----------
 def sys_prompt(uid: int) -> str:
@@ -340,7 +364,6 @@ def sys_prompt(uid: int) -> str:
         par = ""
     return f"{base} {form_hint} {sub} {grd} {par}"
 
-
 def _answers_hint(task_lang: str) -> str:
     if task_lang == "be":
         return "Адказы — па-беларуску. Тлумачэнне — па-руску."
@@ -351,7 +374,6 @@ def _answers_hint(task_lang: str) -> str:
     if task_lang == "en":
         return "Answers in English. Explanation in Russian."
     return "Ответы — по-русски. Пояснение — по-русски."
-
 
 # ---------- Классификатор предмета ----------
 async def classify_subject(text: str) -> str:
@@ -395,7 +417,6 @@ async def classify_subject(text: str) -> str:
         log.warning(f"classify_subject failed: {e}")
         return "auto"
 
-
 # ---------- OCR ----------
 def _preprocess_image(img: Image.Image) -> Image.Image:
     img = ImageOps.exif_transpose(img).convert("L")
@@ -407,7 +428,6 @@ def _preprocess_image(img: Image.Image) -> Image.Image:
         scale = min(max_w / img.width, 3.0)
         img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
     return img
-
 
 def ocr_image(img: Image.Image) -> str:
     base = ImageOps.exif_transpose(img)
@@ -432,7 +452,6 @@ def ocr_image(img: Image.Image) -> str:
                 continue
     return ""
 
-
 # ---------- Гибридный роутер моделей (по умолчанию; заменяется сервисом при наличии) ----------
 HEAVY_MARKERS = (
     "докажи",
@@ -451,7 +470,6 @@ HEAVY_MARKERS = (
     "код",
 )
 
-
 def select_model(prompt: str, mode: str) -> tuple[str, int, str]:
     p = (prompt or "").lower()
     if mode == "free":
@@ -463,7 +481,6 @@ def select_model(prompt: str, mode: str) -> tuple[str, int, str]:
     if heavy:
         return "o4-mini", 1100, "o4-mini"
     return "gpt-4o-mini", 900, "4o-mini"
-
 
 async def call_model(uid: int, user_text: str, mode: str) -> str:
     lang = detect_lang(user_text)
@@ -510,7 +527,6 @@ async def call_model(uid: int, user_text: str, mode: str) -> str:
     log.info(f"LLM model={model} tag={tag} mode={mode} dt={dt:.2f}s")
     return (resp.choices[0].message.content or "").strip()
 
-
 async def call_model_followup(uid: int, prev_task: str, prev_answer: str, follow_q: str, mode_tag: str) -> str:
     """Короткий ответ-уточнение с учётом контекста предыдущего решения."""
     sys = sys_prompt(uid)
@@ -533,7 +549,6 @@ async def call_model_followup(uid: int, prev_task: str, prev_answer: str, follow
     log.info(f"LLM followup model={model} tag={tag} mode={mode_tag} dt={dt:.2f}s")
     return (resp.choices[0].message.content or "").strip()
 
-
 # ---------- (NEW) Единая отправка с обработкой формул ----------
 async def reply_with_formulas(message: Message, raw_text: str, reply_markup=None):
     text = postprocess_formulas(raw_text or "")
@@ -546,10 +561,8 @@ async def reply_with_formulas(message: Message, raw_text: str, reply_markup=None
         except Exception as e:
             log.warning(f"TEX render fail: {e}")
 
-
 # ---------- Внутренние метрики (в RAM) ----------
 STATS_LOCK = threading.RLock()
-
 
 class UserStats:
     __slots__ = (
@@ -588,9 +601,7 @@ class UserStats:
         self.ocr_fail = 0
         self.bytes_images_in = 0
 
-
 USERS: dict[int, UserStats] = {}
-
 
 def _get_user_stats(uid: int, update: Update | None = None) -> UserStats:
     with STATS_LOCK:
@@ -601,7 +612,6 @@ def _get_user_stats(uid: int, update: Update | None = None) -> UserStats:
             st.name = update.effective_user.full_name or st.name
             st.username = update.effective_user.username or st.username
         return st
-
 
 def stats_snapshot() -> dict:
     with STATS_LOCK:
@@ -664,7 +674,6 @@ def stats_snapshot() -> dict:
         totals["langs"] = dict(langs_acc)
         return {"generated_at": int(time.time()), "users": snap_users, "totals": totals}
 
-
 def stats_save():
     os.makedirs(os.path.dirname(METRICS_PATH), exist_ok=True)
     data = json.dumps(stats_snapshot(), ensure_ascii=False, indent=2).encode("utf-8")
@@ -679,7 +688,6 @@ def stats_save():
                 os.remove(tmp)
             except Exception:
                 pass
-
 
 def stats_load():
     if not os.path.exists(METRICS_PATH):
@@ -710,7 +718,6 @@ def stats_load():
     except Exception as e:
         log.warning(f"stats_load failed: {e}")
 
-
 def _stats_autosave_loop():
     interval = max(10, METRICS_AUTOSAVE_SEC)
     log.info(f"Metrics autosave every {interval}s -> {METRICS_PATH}")
@@ -720,7 +727,6 @@ def _stats_autosave_loop():
         except Exception as e:
             log.warning(f"stats_save failed: {e}")
         time.sleep(interval)
-
 
 # ---------- Команды ----------
 async def set_commands(app: Application):
@@ -740,16 +746,16 @@ async def set_commands(app: Application):
             BotCommand("essay", "Сочинение: /essay ТЕМА"),
             BotCommand("vdbtest", "Проверить поиск в ВБД (админ)"),
             BotCommand("whoami", "Показать мой Telegram ID"),
+            BotCommand("admin", "Админ-панель"),
+            BotCommand("admins", "Список админов"),
         ]
     )
-
 
 async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     await update.message.reply_text(
         f"Твой Telegram ID: <code>{uid}</code>", parse_mode="HTML", reply_markup=kb(uid)
     )
-
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -763,10 +769,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb(uid),
     )
 
-
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_cmd(update, context)
-
 
 async def about_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply_html(
@@ -779,10 +783,8 @@ async def about_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb(update.effective_user.id),
     )
 
-
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await about_cmd(update, context)
-
 
 async def subject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -796,14 +798,12 @@ async def subject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     USER_SUBJECT[uid] = val
     await update.message.reply_text(f"Предмет: {val}", reply_markup=kb(uid))
 
-
 async def grade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not context.args or context.args[0] not in [str(i) for i in range(5, 12)]:
         return await update.message.reply_text("Пример: /grade 7", reply_markup=kb(uid))
     USER_GRADE[uid] = context.args[0]
     await update.message.reply_text(f"Класс: {USER_GRADE[uid]}", reply_markup=kb(uid))
-
 
 async def parent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -813,7 +813,6 @@ async def parent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Режим для родителей: {'вкл' if PARENT_MODE[uid] else 'выкл'}", reply_markup=kb(uid)
     )
-
 
 # === Импорт сервисов (лимиты/платежи/роутер моделей) ===
 # Порядок: services/* -> корневые модули (fallback).
@@ -866,7 +865,6 @@ except Exception as e:
             "Критично: нет модулей лимитов/оплат. Проверь services/usage.py, services/payments.py, services/router.py"
         )
 
-
 def _stars_amount(payload: str) -> int:
     # отдаём сервису, если он есть; иначе — окружение/дефолты
     if callable(globals().get("_get_stars_amount_ext")):
@@ -882,7 +880,6 @@ def _stars_amount(payload: str) -> int:
     }
     return defaults.get(payload, 100)
 
-
 async def free_vs_pro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     plan = get_user_plan(uid)
@@ -895,7 +892,6 @@ async def free_vs_pro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await safe_reply_html(update.message, msg, reply_markup=kb(uid))
 
-
 async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb_i = build_buy_keyboard(
         stars_enabled=TELEGRAM_STARS_ENABLED and (TELEGRAM_PROVIDER_TOKEN == ""),
@@ -903,7 +899,6 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         erip_url=ERIP_CHECKOUT_URL or None,
     )
     await update.message.reply_text("Выбери способ оплаты:", reply_markup=kb_i)
-
 
 # ---------- Основные действия ----------
 async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -951,7 +946,6 @@ async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         await spinner_finish()
 
-
 async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     topic = " ".join(context.args).strip()
@@ -988,7 +982,6 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=kb(uid))
     finally:
         await spinner_finish()
-
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1051,7 +1044,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USER_STATE[uid] = "AWAIT_TEXT_OR_PHOTO_CHOICE"
     finally:
         await spinner_finish()
-
 
 # ---------- Тексты и кнопки ----------
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1133,7 +1125,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb_i = build_buy_keyboard(
                 stars_enabled=TELEGRAM_STARS_ENABLED and (TELEGRAM_PROVIDER_TOKEN == ""),
                 card_url=CARD_CHECKOUT_URL or None,
-                erip_url=ERIP_CHECKOUT_URL or None,
+                erip_url=ERIP_CHECKOUT_URL или None,
             )
             USER_STATE[uid] = None
             return await update.message.reply_text(
@@ -1191,8 +1183,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.args = [raw]
     return await explain_cmd(update, context)
 
-
-# ---------- Статистика / админ ----------
+# ---------- Мои метрики ----------
 async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     s = my_stats(uid)
@@ -1203,9 +1194,9 @@ async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb(uid),
     )
 
-
+# ---------- Админ-команды ----------
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]:
+    if not is_admin(update.effective_user.id):
         return await update.message.reply_text("Недостаточно прав.")
     s = daily_summary()
     await update.message.reply_text(
@@ -1214,10 +1205,48 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"(credit={s['credit']}, sub={s['sub']})"
     )
 
+async def admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return await update.message.reply_text("Недостаточно прав.")
+    env_ids = sorted(_env_admin_ids())
+    db_ids = sorted(_load_admins_from_db())
+    union_ids = sorted(all_admin_ids())
+    lines = [
+        "<b>Админы (ENV):</b> " + (", ".join(map(str, env_ids)) or "—"),
+        "<b>Админы (DB):</b> " + (", ".join(map(str, db_ids)) or "—"),
+        "<b>Итого:</b> " + (", ".join(map(str, union_ids)) or "—"),
+        "",
+        "Добавить: <code>/sudo_add 123456789</code>",
+        "Удалить: <code>/sudo_del 123456789</code>",
+    ]
+    await update.message.reply_html("\n".join(lines))
+
+async def sudo_add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return await update.message.reply_text("Недостаточно прав.")
+    if not context.args or not context.args[0].isdigit():
+        return await update.message.reply_text("Используй: /sudo_add <telegram_id>")
+    target = int(context.args[0])
+    add_admin(target)
+    log.info(f"ADMIN: {uid} added admin {target}")
+    await update.message.reply_text(f"Готово. Добавлен admin: {target}")
+
+async def sudo_del_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return await update.message.reply_text("Недостаточно прав.")
+    if not context.args or not context.args[0].isdigit():
+        return await update.message.reply_text("Используй: /sudo_del <telegram_id>")
+    target = int(context.args[0])
+    del_admin(target)
+    log.info(f"ADMIN: {uid} removed admin {target}")
+    await update.message.reply_text(f"Готово. Удалён admin: {target}")
 
 # ---------- ВБД: тестовый поиск (админ) ----------
 async def vdbtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]:
+    if not is_admin(update.effective_user.id):
         return await update.message.reply_text("Недостаточно прав.")
     q = " ".join(context.args).strip() if context.args else ""
     if not q:
@@ -1227,7 +1256,6 @@ async def vdbtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         int(USER_GRADE[update.effective_user.id]) if str(USER_GRADE[update.effective_user.id]).isdigit() else 8
     )
     try:
-        # ограничение длины запроса и top_k в эндпоинте; тут — фиксированно 5
         q_clamped = clamp_words(q, 40)
         rules = await search_rules(client, q_clamped, subj_key, grade_int, top_k=5)
         if not rules and subj_key != USER_SUBJECT[update.effective_user.id]:
@@ -1248,6 +1276,117 @@ async def vdbtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Ошибка ВБД: {e}")
 
+# ---------- /admin панель ----------
+def admin_kb(page_users: int = 1) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📈 Метрики", callback_data="admin:metrics")],
+        [InlineKeyboardButton("👥 Пользователи", callback_data=f"admin:users:{page_users}")],
+        [InlineKeyboardButton("💳 Платежи", callback_data="admin:billing")],
+        [InlineKeyboardButton("🧠 ВБД", callback_data="admin:vdb")],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="admin:settings")],
+    ])
+
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return await update.message.reply_text("Недостаточно прав.")
+    await update.message.reply_text("Админ-панель:", reply_markup=admin_kb())
+
+def _format_metrics_for_admin() -> str:
+    s = stats_snapshot()
+    t = s["totals"]
+    lines = [
+        "<b>Метрики</b>",
+        f"Пользователей: {t['users_count']}",
+        f"Задач всего: {t['tasks_total']} (text={t['solve_text']}, photo={t['solve_photo']}, essay={t['essay']})",
+        f"GPT вызовов: {t['gpt_calls']} за {t['gpt_time_sum']:.1f}s",
+        f"OCR ok/fail: {t['ocr_ok']}/{t['ocr_fail']}",
+    ]
+    return "\n".join(lines)
+
+def _paginate_users(page: int, per_page: int = 10) -> tuple[str, InlineKeyboardMarkup]:
+    ids = sorted(USERS.keys())
+    total = len(ids)
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(page, pages))
+    start = (page - 1) * per_page
+    chunk = ids[start:start + per_page]
+    lines = [f"<b>Пользователи</b> (страница {page}/{pages}, всего {total})"]
+    for uid in chunk:
+        st = USERS[uid]
+        seen = time.strftime("%Y-%m-%d %H:%M", time.localtime(st.last_seen))
+        kinds = ", ".join(f"{k}:{v}" for k, v in st.kinds.items()) or "—"
+        lines.append(f"• <code>{uid}</code> — {html.escape(st.name or '')} (@{st.username or '—'})")
+        lines.append(f"  seen={seen}; gpt={st.gpt_calls}; {kinds}")
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("« Назад", callback_data=f"admin:users:{page-1}"))
+    if page < pages:
+        nav.append(InlineKeyboardButton("Вперёд »", callback_data=f"admin:users:{page+1}"))
+    kb = InlineKeyboardMarkup([nav, [InlineKeyboardButton("⬅️ Меню", callback_data="admin:menu")]]) if nav else InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Меню", callback_data="admin:menu")]])
+    return "\n".join(lines), kb
+
+async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_admin(uid):
+        return await q.answer("Недостаточно прав.", show_alert=True)
+    data = q.data or ""
+    log.info(f"ADMIN_CLICK by {uid}: {data}")
+
+    if data == "admin:menu":
+        await q.edit_message_text("Админ-панель:", reply_markup=admin_kb())
+        return
+
+    if data == "admin:metrics":
+        text = _format_metrics_for_admin()
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Меню", callback_data="admin:menu"),
+             InlineKeyboardButton("JSON", callback_data="admin:metrics_json")]
+        ]))
+        return
+
+    if data == "admin:metrics_json":
+        snap = json.dumps(stats_snapshot(), ensure_ascii=False)[:3500]
+        await q.edit_message_text(f"<pre>{html.escape(snap)}</pre>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Меню", callback_data="admin:menu")]
+        ]))
+        return
+
+    if data.startswith("admin:users:"):
+        try:
+            page = int(data.split(":")[2])
+        except Exception:
+            page = 1
+        text, kb_i = _paginate_users(page)
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb_i)
+        return
+
+    if data == "admin:vdb":
+        kb_i = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📌 Подсказка по /vdbtest", callback_data="admin:vdb:hint")],
+            [InlineKeyboardButton("⬅️ Меню", callback_data="admin:menu")],
+        ])
+        await q.edit_message_text("Раздел ВБД.", reply_markup=kb_i)
+        return
+
+    if data == "admin:vdb:hint":
+        await q.edit_message_text(
+            "Примеры:\n"
+            "<code>/vdbtest формула площади трапеции</code>\n"
+            "<code>/vdbtest раствор цемента м200 пропорции 5</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Меню", callback_data="admin:menu")]]),
+        )
+        return
+
+    if data == "admin:billing":
+        await q.edit_message_text(
+            "Платежи: интегрируй сводку из services/usage.py + payments.\n"
+            "Показывать: выручка, кол-во покупок, конверсия, последние N операций.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Меню", callback_data="admin:menu")]]),
+        )
+        return
 
 # ---------- Callbacks / Telegram Payments ----------
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1275,11 +1414,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await q.edit_message_text("Открыл счёт в Telegram. Заверши оплату, пожалуйста.")
     return None
 
-
 async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query: PreCheckoutQuery = update.pre_checkout_query
     await query.answer(ok=True)
-
 
 async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1291,7 +1428,6 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
     if payload:
         msg = apply_payment_payload(uid, payload)
         await update.message.reply_text(msg + "\nПроверить баланс: /mystats")
-
 
 # ---------- Health + webhooks (карта/ЕРИП) + VDB upsert + (NEW) VDB search ----------
 class _Health(BaseHTTPRequestHandler):
@@ -1352,13 +1488,10 @@ class _Health(BaseHTTPRequestHandler):
                 except Exception:
                     grade_int = 8
 
-                # Если subject не задан — попробуем текущий default "auto" → будет fallback как в боте.
                 q_clamped = clamp_words(q, 40)
                 try:
-                    # Ищем сперва по subj_key (если не auto), иначе — по auto (логика внутри search_rules допускает ключи)
                     rules = asyncio.run(search_rules(client, q_clamped, subj_key, grade_int, top_k=top_k))
                     if not rules and subj_key != "auto":
-                        # fallback: в raw-предмет (если кто-то укажет необычный ключ)
                         rules = asyncio.run(search_rules(client, q_clamped, subject_in or "auto", grade_int, top_k=top_k))
                 except Exception as e:
                     return self._err(500, {"ok": False, "error": f"search failed: {e}"}, "application/json; charset=utf-8")
@@ -1392,7 +1525,7 @@ class _Health(BaseHTTPRequestHandler):
                 return self._ok(msg.encode("utf-8"))
 
             if path == "/webhook/erip":
-                if auth != ERIP_WEBHOOK_SECRET or not ERIP_WEBHOOK_SECRET:
+                if auth != ERIP_WEBHOOK_SECRET или not ERIP_WEBHOOK_SECRET:
                     return self._err(401, "bad auth")
                 uid = int(data.get("user_id", 0) or 0)
                 kind = data.get("kind")
@@ -1406,7 +1539,6 @@ class _Health(BaseHTTPRequestHandler):
                     return self._err(401, "bad auth")
                 rules = data.get("rules") or []
                 try:
-                    # Если список пуст — не трогаем OpenAI/ВБД, просто отвечаем ок
                     if not rules:
                         return self._ok(b"VDB upsert ok (0)")
                     from rag_vdb import upsert_rules
@@ -1419,16 +1551,13 @@ class _Health(BaseHTTPRequestHandler):
         except Exception as e:
             return self._err(500, f"error: {e}")
 
-
 def _run_health():
     HTTPServer(("0.0.0.0", PORT), _Health).serve_forever()
-
 
 # ---------- MAIN ----------
 class _HealthThread(threading.Thread):
     def run(self):
         _run_health()
-
 
 def main():
     try:
@@ -1441,6 +1570,7 @@ def main():
 
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(set_commands).build()
 
+    # Команды
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -1455,18 +1585,23 @@ def main():
     app.add_handler(CommandHandler("essay", essay_cmd))
     app.add_handler(CommandHandler("vdbtest", vdbtest_cmd))
     app.add_handler(CommandHandler("whoami", whoami_cmd))
+    app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("admins", admins_cmd))
+    app.add_handler(CommandHandler("sudo_add", sudo_add_cmd))
+    app.add_handler(CommandHandler("sudo_del", sudo_del_cmd))
 
-    app.add_handler(CallbackQueryHandler(on_callback))
+    # Колбэки: сначала админские, затем платёжные
+    app.add_handler(CallbackQueryHandler(on_admin_callback, pattern=r"^admin:"))
+    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^buy_stars:"))
     app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
     app.add_handler(MessageHandler(f.SUCCESSFUL_PAYMENT, successful_payment_handler))
 
+    # Контент
     app.add_handler(MessageHandler(f.PHOTO | f.Document.IMAGE, handle_photo))
     app.add_handler(MessageHandler(f.TEXT & ~f.COMMAND, on_text))
 
-    log.info("Gotovo R1+VDB running…")
+    log.info("Gotovo R1+VDB+Admin running…")
     app.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
-
