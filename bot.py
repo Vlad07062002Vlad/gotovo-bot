@@ -79,7 +79,9 @@ if not TELEGRAM_TOKEN:
 if not OPENAI_API_KEY:
     raise SystemExit("Нет OPENAI_API_KEY (fly secrets set OPENAI_API_KEY=...)")
 
-client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+# --- ДОБАВЛЕНО: таймаут/ретраи для OpenAI клиента ---
+OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "30"))  # сек
+client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT, max_retries=2)
 
 # ---------- Только followup-таблица в локальной БД (не дублируем users/events/sub_usage) ----------
 def _db_followup():
@@ -488,21 +490,36 @@ async def call_model(uid: int, user_text: str, mode: str) -> str:
     model, max_out, tag = select_model(user_text, mode)
     sys = sys_prompt(uid)
 
-    # ----- ВБД (RAG) -----
+    # ----- ВБД (RAG) c таймаутами и фолбэком -----
     vdb_hints = []
     try:
         subj_key = subject_to_vdb_key(USER_SUBJECT[uid])
         grade_int = int(USER_GRADE[uid]) if str(USER_GRADE[uid]).isdigit() else 8
         query_for_vdb = clamp_words(user_text, 40)
-        rules = await search_rules(client, query_for_vdb, subj_key, grade_int)  # []
+
+        async def _srch(skey):
+            return await search_rules(client, query_for_vdb, skey, grade_int)
+
+        try:
+            rules = await asyncio.wait_for(_srch(subj_key), timeout=3.0)
+        except Exception as e:
+            log.warning(f"VDB primary timeout/fail: {e}")
+            rules = []
+
         if not rules and subj_key != USER_SUBJECT[uid]:
-            rules = await search_rules(client, query_for_vdb, USER_SUBJECT[uid], grade_int)
+            try:
+                rules = await asyncio.wait_for(_srch(USER_SUBJECT[uid]), timeout=3.0)
+            except Exception as e:
+                log.warning(f"VDB fallback timeout/fail: {e}")
+                rules = []
+
         for r in (rules or [])[:5]:
-            brief = r.get("rule_brief") or ""
+            brief = (r.get("rule_brief") if isinstance(r, dict) else str(r)) or ""
+            brief = clamp_words(brief, 120)
             if brief:
                 vdb_hints.append(f"• {brief}")
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"VDB block error: {e}")
 
     vdb_context = ""
     if vdb_hints:
@@ -516,16 +533,25 @@ async def call_model(uid: int, user_text: str, mode: str) -> str:
         f"{_answers_hint(lang)}\n\nТекст/условие:\n{user_text}" + vdb_context
     )
 
+    # ----- Страховка LLM-вызова (таймауты на стороне клиента, логгирование) -----
     t0 = perf_counter()
-    resp = await client.chat.completions.create(
-        model=model,
-        messages=[{"role": "system", "content": sys}, {"role": "user", "content": content}],
-        temperature=0.25 if mode in {"free", "trial"} else 0.3,
-        max_tokens=max_out,
-    )
+    try:
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": content}],
+            temperature=0.25 if mode in {"free", "trial"} else 0.3,
+            max_tokens=max_out,
+        )
+        out_text = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        log.exception("LLM error")
+        out_text = (
+            "❌ Не получилось получить ответ от модели. "
+            "Попробуй ещё раз через минуту. Тех. детали в логах."
+        )
     dt = perf_counter() - t0
     log.info(f"LLM model={model} tag={tag} mode={mode} dt={dt:.2f}s")
-    return (resp.choices[0].message.content or "").strip()
+    return out_text
 
 async def call_model_followup(uid: int, prev_task: str, prev_answer: str, follow_q: str, mode_tag: str) -> str:
     """Короткий ответ-уточнение с учётом контекста предыдущего решения."""
@@ -539,15 +565,23 @@ async def call_model_followup(uid: int, prev_task: str, prev_answer: str, follow
     )
     model, max_out, tag = select_model(prev_task + " " + follow_q, mode_tag)
     t0 = perf_counter()
-    resp = await client.chat.completions.create(
-        model=model,
-        messages=[{"role": "system", "content": sys}, {"role": "user", "content": prompt}],
-        temperature=0.25 if mode_tag in {"free", "trial"} else 0.3,
-        max_tokens=min(600, max_out),
-    )
+    try:
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": prompt}],
+            temperature=0.25 if mode_tag in {"free", "trial"} else 0.3,
+            max_tokens=min(600, max_out),
+        )
+        out = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        log.exception("LLM followup error")
+        out = (
+            "❌ Не удалось получить уточнение от модели. "
+            "Попробуй ещё раз или переформулируй вопрос."
+        )
     dt = perf_counter() - t0
     log.info(f"LLM followup model={model} tag={tag} mode={mode_tag} dt={dt:.2f}s")
-    return (resp.choices[0].message.content or "").strip()
+    return out
 
 # ---------- (NEW) Единая отправка с обработкой формул ----------
 async def reply_with_formulas(message: Message, raw_text: str, reply_markup=None):
@@ -1528,7 +1562,7 @@ class _Health(BaseHTTPRequestHandler):
                 if auth != ERIP_WEBHOOK_SECRET or not ERIP_WEBHOOK_SECRET:
                     return self._err(401, "bad auth")
                 uid = int(data.get("user_id", 0) or 0)
-                kind = data.get("kind")
+                kind = data.get("kind")  # важная строка — целая
                 if not uid or not kind:
                     return self._err(400, "bad payload")
                 msg = apply_payment_payload(uid, kind)
