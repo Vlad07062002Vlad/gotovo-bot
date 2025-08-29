@@ -1227,10 +1227,12 @@ async def vdbtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         int(USER_GRADE[update.effective_user.id]) if str(USER_GRADE[update.effective_user.id]).isdigit() else 8
     )
     try:
-        rules = await search_rules(client, clamp_words(q, 40), subj_key, grade_int, top_k=5)
+        # ограничение длины запроса и top_k в эндпоинте; тут — фиксированно 5
+        q_clamped = clamp_words(q, 40)
+        rules = await search_rules(client, q_clamped, subj_key, grade_int, top_k=5)
         if not rules and subj_key != USER_SUBJECT[update.effective_user.id]:
             rules = await search_rules(
-                client, clamp_words(q, 40), USER_SUBJECT[update.effective_user.id], grade_int, top_k=5
+                client, q_clamped, USER_SUBJECT[update.effective_user.id], grade_int, top_k=5
             )
         if not rules:
             return await update.message.reply_text("⚠️ Ничего не нашёл в ВБД по этому запросу.")
@@ -1291,7 +1293,7 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
         await update.message.reply_text(msg + "\nПроверить баланс: /mystats")
 
 
-# ---------- Health + webhooks (карта/ЕРИП) + VDB upsert ----------
+# ---------- Health + webhooks (карта/ЕРИП) + VDB upsert + (NEW) VDB search ----------
 class _Health(BaseHTTPRequestHandler):
     def _ok(self, body: bytes, ctype="text/plain; charset=utf-8"):
         self.send_response(200)
@@ -1300,10 +1302,10 @@ class _Health(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _err(self, code: int, msg: str):
-        body = msg.encode("utf-8")
+    def _err(self, code: int, msg: str, ctype="text/plain; charset=utf-8"):
+        body = (msg if isinstance(msg, str) else json.dumps(msg, ensure_ascii=False)).encode("utf-8")
         self.send_response(code)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1325,8 +1327,61 @@ class _Health(BaseHTTPRequestHandler):
             raw = self.rfile.read(length) if length > 0 else b"{}"
             data = json.loads(raw.decode("utf-8") or "{}")
             auth = self.headers.get("X-Auth", "")
+            path = self.path
 
-            if self.path == "/webhook/card":
+            # --- (NEW) /vdb/search: прямой REST для sanity-тестов ---
+            if path == "/vdb/search":
+                q = str(data.get("q", "") or "").strip()
+                if not q:
+                    return self._err(400, {"ok": False, "error": "empty q"}, "application/json; charset=utf-8")
+                top_k = data.get("top_k", 5)
+                try:
+                    top_k = int(top_k)
+                except Exception:
+                    top_k = 5
+                if top_k < 1:
+                    top_k = 1
+                if top_k > 20:
+                    top_k = 20
+
+                subject_in = str(data.get("subject", "") or "").strip().lower()
+                grade_in = data.get("grade", None)
+                subj_key = subject_to_vdb_key(subject_in) if subject_in else "auto"
+                try:
+                    grade_int = int(grade_in) if grade_in is not None else 8
+                except Exception:
+                    grade_int = 8
+
+                # Если subject не задан — попробуем текущий default "auto" → будет fallback как в боте.
+                q_clamped = clamp_words(q, 40)
+                try:
+                    # Ищем сперва по subj_key (если не auto), иначе — по auto (логика внутри search_rules допускает ключи)
+                    rules = asyncio.run(search_rules(client, q_clamped, subj_key, grade_int, top_k=top_k))
+                    if not rules and subj_key != "auto":
+                        # fallback: в raw-предмет (если кто-то укажет необычный ключ)
+                        rules = asyncio.run(search_rules(client, q_clamped, subject_in or "auto", grade_int, top_k=top_k))
+                except Exception as e:
+                    return self._err(500, {"ok": False, "error": f"search failed: {e}"}, "application/json; charset=utf-8")
+
+                items = []
+                for r in (rules or []):
+                    items.append({
+                        "id": r.get("id"),
+                        "score": float(r.get("score", 0) or 0),
+                        "rule": r.get("rule_brief") or r.get("text") or r.get("rule") or "",
+                        "source": " · ".join([x for x in [(r.get("book") or ""), (r.get("chapter") or ""), f"стр. {r.get('page')}" if r.get("page") else ""] if x]),
+                        "meta": {
+                            "book": r.get("book"),
+                            "chapter": r.get("chapter"),
+                            "page": r.get("page"),
+                            "subject": subject_in or subj_key,
+                            "grade": grade_int,
+                        },
+                    })
+                payload = {"ok": True, "count": len(items), "items": items}
+                return self._ok(json.dumps(payload, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+
+            if path == "/webhook/card":
                 if auth != CARD_WEBHOOK_SECRET or not CARD_WEBHOOK_SECRET:
                     return self._err(401, "bad auth")
                 uid = int(data.get("user_id", 0) or 0)
@@ -1336,7 +1391,7 @@ class _Health(BaseHTTPRequestHandler):
                 msg = apply_payment_payload(uid, kind)
                 return self._ok(msg.encode("utf-8"))
 
-            if self.path == "/webhook/erip":
+            if path == "/webhook/erip":
                 if auth != ERIP_WEBHOOK_SECRET or not ERIP_WEBHOOK_SECRET:
                     return self._err(401, "bad auth")
                 uid = int(data.get("user_id", 0) or 0)
@@ -1346,7 +1401,7 @@ class _Health(BaseHTTPRequestHandler):
                 msg = apply_payment_payload(uid, kind)
                 return self._ok(msg.encode("utf-8"))
 
-            if self.path == "/vdb/upsert":
+            if path == "/vdb/upsert":
                 if auth != VDB_WEBHOOK_SECRET or not VDB_WEBHOOK_SECRET:
                     return self._err(401, "bad auth")
                 rules = data.get("rules") or []
@@ -1414,3 +1469,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
