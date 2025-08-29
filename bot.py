@@ -1125,7 +1125,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb_i = build_buy_keyboard(
                 stars_enabled=TELEGRAM_STARS_ENABLED and (TELEGRAM_PROVIDER_TOKEN == ""),
                 card_url=CARD_CHECKOUT_URL or None,
-                erip_url=ERIP_CHECKOUT_URL или None,
+                erip_url=ERIP_CHECKOUT_URL or None,
             )
             USER_STATE[uid] = None
             return await update.message.reply_text(
@@ -1525,7 +1525,7 @@ class _Health(BaseHTTPRequestHandler):
                 return self._ok(msg.encode("utf-8"))
 
             if path == "/webhook/erip":
-                if auth != ERIP_WEBHOOK_SECRET или not ERIP_WEBHOOK_SECRET:
+                if auth != ERIP_WEBHOOK_SECRET or not ERIP_WEBHOOK_SECRET:
                     return self._err(401, "bad auth")
                 uid = int(data.get("user_id", 0) or 0)
                 kind = data.get("kind")
