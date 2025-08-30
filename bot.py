@@ -1432,9 +1432,18 @@ def _register_handlers(app: Application):
 # ---------- post_init: строго в builder ----------
 async def _post_init(app: Application):
     try:
+        # 1) Гарантированно отключаем webhook перед polling (фикс 409 Conflict)
+        try:
+            await app.bot.delete_webhook(drop_pending_updates=True)
+            log.info("Webhook deleted (drop_pending_updates=True)")
+        except Exception as e:
+            log.warning(f"delete_webhook failed: {e}")
+
+        # 2) Команды
         await set_commands(app)
+        log.info("Bot commands set")
     except Exception as e:
-        log.warning(f"set_commands failed: {e}")
+        log.warning(f"post_init failed: {e}")
 
 # ---------- MAIN ----------
 def main():
