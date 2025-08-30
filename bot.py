@@ -258,59 +258,20 @@ def sys_prompt(uid: int) -> str:
     subject = USER_SUBJECT[uid]; grade = USER_GRADE[uid]; parent = PARENT_MODE[uid]
     base = (
         "Ты — школьный помощник и ИСПОЛНИТЕЛЬ домашнего задания. "
-        "Сначала выдай <b>Ответы</b> (готовый результат по пунктам), затем обязательно дай <b>Подробное Пояснение</b> — по шагам, простым русским. "
-        "1) Переформулируй условие коротко; 2) Объясни, зачем нужен каждый шаг; 3) Ход решения мини-шагами; "
-        "4) Типичные ошибки; 5) Проверка; 6) Самый простой способ. "
-        "Если в базе (ВДБ) нет точного материала — всё равно решай, опираясь на предметные знания. "
-        "Разрешённые HTML-теги: <b>, <i>, <code>, <pre>."
+        "Сначала выдай <b>Ответы</b> (готовый результат по пунктам), затем — <b>Подробное Пояснение</b> простым русским. "
+        "Структура пояснения: 1) Коротко переформулируй условие; 2) Зачем нужен каждый шаг; "
+        "3) Ход решения мини‑шагами; 4) Типичные ошибки; 5) Самопроверка; 6) Самый короткий способ. "
+        "Если в ВБД нет точного материала — всё равно решай, опираясь на предметные знания. "
+        "Разрешённые HTML‑теги: <b>, <i>, <code>, <pre>."
     )
-    form_hint = "Ключевые формулы в <pre>, при возможности добавляй TeX: \\int_0^1 x^2\\,dx"
+    form_hint = "Ключевые формулы показывай в <pre>. При возможности добавляй TeX (например: \int_0^1 x^2\,dx)."
     sub = f"Предмет: {subject}." if subject != "auto" else "Определи предмет сам."
     grd = f"Класс: {grade}."
-    par = ("<b>Памятка для родителей:</b> на что смотреть при проверке; что должен проговорить ребёнок; типичные ошибки; мини-тренировка."
+    par = ("<b>Памятка для родителей:</b> что спросить у ребёнка; на какие места в решении смотреть; мини‑тренировка на 2–3 задания."
            if parent else "")
     return f"{base} {form_hint} {sub} {grd} {par}"
 
-def _answers_hint(task_lang: str) -> str:
-    return {
-        "be": "Адказы — па-беларуску. Тлумачэнне — па-руску.",
-        "de": "Antworten auf Deutsch. Erklärung auf Russisch.",
-        "fr": "Réponses en français. Explication en russe.",
-        "en": "Answers in English. Explanation in Russian.",
-    }.get(task_lang, "Ответы — по-русски. Пояснение — по-русски.")
 
-# ---------- Классификатор предмета ----------
-async def classify_subject(text: str) -> str:
-    try:
-        choices = ", ".join(sorted(SUBJECTS - {"auto"}))
-        prompt = (
-            "К какому школьному предмету относится это задание? Выбери РОВНО ОДНО из списка: "
-            f"{choices}. Если не очевидно — ответь «auto». Только одно слово.\n\n{text[:3000]}"
-        )
-        resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Классификатор. Ответ одним словом из списка или 'auto'."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0,
-            max_tokens=10,
-        )
-        ans = (resp.choices[0].message.content or "").strip().lower()
-        mapping = {
-            "беларуская мова":"беларуская мова", "беларуская літаратура":"беларуская літаратура",
-            "русский язык":"русский","литература":"литература","математика":"математика","информатика":"информатика",
-            "физика":"физика","химия":"химия","история":"история","обществознание":"обществознание","биология":"биология",
-            "география":"география","английский":"английский","auto":"auto",
-        }
-        for k, v in mapping.items():
-            if ans == k: return v if v in SUBJECTS else "auto"
-        return ans if ans in SUBJECTS else "auto"
-    except Exception as e:
-        log.warning(f"classify_subject failed: {e}")
-        return "auto"
-
-# ---------- OCR ----------
 def _preprocess_image(img: Image.Image) -> Image.Image:
     img = ImageOps.exif_transpose(img).convert("L")
     img = ImageOps.autocontrast(img)
@@ -722,17 +683,27 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_cmd(update, context)
-
 async def about_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_reply_html(
-        update.message,
-        "<b>📘 О боте «Готово!»</b>\n"
-        "• Решаю и объясняю школьные задания 5–11 классов.\n"
-        "• Free: 3/день (только текст) + 1 Trial Pro/день.\n"
-        "• Pro: больше лимитов и приоритет; тяжёлые задачи → o4-mini/4o.\n"
-        "• Оплата: Telegram Stars / Карта РБ / ЕРИП.",
-        reply_markup=kb(update.effective_user.id),
+    uid = update.effective_user.id if update and update.effective_user else 0
+    txt = (
+        "<b>📘 О боте «Готово!»</b>
+"
+        "• 5–11 классы: решаю задачи и объясняю «по-людски». Сначала <b>Ответы</b>, потом <b>Пояснение</b> по шагам.
+"
+        "• <b>Родителям</b>: даю памятку — что спросить у ребёнка, на какие ошибки смотреть, мини‑тренировку.
+"
+        "• Формулы/чертежи: аккуратно оформляю, где могу — LaTeX. Фото заданий тоже ок (в Pro/Trial).
+"
+        "• Тарифы: Free — 3 запроса/день + 1 Trial Pro/день; Pro — расширенные лимиты и приоритет (o4‑mini/4o).
+"
+        "• Оплаты: Telegram Stars, карта РБ, ЕРИП. bePaid — подключим позже.
+
+"
+        "Чтобы начать — просто пришли задание текстом или фото. Если «первый класс как институт 😂» — разложу на <i>микро‑шаги</i>."
     )
+    await safe_reply_html(update.message, txt, reply_markup=kb(uid))
+
+
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await about_cmd(update, context)
@@ -1052,6 +1023,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await explain_cmd(update, context)
 
 # ---------- Мои метрики — c таймаутом (анти-зависание) ----------
+# ---------- Мои метрики — c таймаутом (анти-зависание) ----------
 async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     try:
@@ -1062,13 +1034,27 @@ async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
              "last7": {"free": 0, "trial": 0, "credit": 0, "sub": 0},
              "last30": {"free": 0, "trial": 0, "credit": 0, "sub": 0}}
     await update.message.reply_text(
-        f"Сегодня: free {s['today']['free']}, trial {s['today']['trial']}, credit {s['today']['credit']}, sub {s['today']['sub']}\n"
-        f"7 дней:  free {s['last7']['free']}, trial {s['last7']['trial']}, credit {s['last7']['credit']}, sub {s['last7']['sub']}\n"
+        f"Сегодня: free {s['today']['free']}, trial {s['today']['trial']}, credit {s['today']['credit']}, sub {s['today']['sub']}
+"
+        f"7 дней:  free {s['last7']['free']}, trial {s['last7']['trial']}, credit {s['last7']['credit']}, sub {s['last7']['sub']}
+"
         f"30 дней: free {s['last30']['free']}, trial {s['last30']['trial']}, credit {s['last30']['credit']}, sub {s['last30']['sub']}",
         reply_markup=kb(uid),
     )
+# ---------- /stats (админ) или личные метрики для обычных ----------
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return await mystats_cmd(update, context)
+    try:
+        text = _format_metrics_for_admin()
+        kb_i = InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Админ-панель", callback_data="admin:menu")]])
+        return await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb_i)
+    except Exception as e:
+        log.exception("/stats")
+        return await update.message.reply_text(f"Не получилось собрать метрики: {e}")
 
-# ---------- Админка ----------
+
 def admin_kb(page_users: int = 1) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📈 Метрики", callback_data="admin:metrics")],
@@ -1204,6 +1190,7 @@ async def sudo_del_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Готово. Удалён admin: {target}")
 
 # ---------- ВБД: тестовый поиск (админ) ----------
+# ---------- ВБД: тестовый поиск (админ) ----------
 async def vdbtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     try:
@@ -1211,23 +1198,56 @@ async def vdbtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await update.message.reply_text("Недостаточно прав.")
     except Exception:
         return await update.message.reply_text("Недостаточно прав.")
-
     q = " ".join(context.args).strip() if context.args else ""
     if not q:
         return await update.message.reply_text(
-            "Использование: /vdbtest запрос...\n"
-            "Пример: /vdbtest формула площади трапеции\n"
+            "Использование: /vdbtest запрос...
+"
+            "Пример: /vdbtest формула площади трапеции
+"
             "Пример: /vdbtest раствор цемента м200 пропорции 5"
         )
-
     subj_raw = USER_SUBJECT.get(uid, "auto")
     subj_key = subject_to_vdb_key(subj_raw)
     try:
         grade_int = int(USER_GRADE.get(uid, "8")) if str(USER_GRADE.get(uid, "8")).isdigit() else 8
     except Exception:
         grade_int = 8
-
     q_clamped = clamp_words(q, 40)
+    async def _srch(skey):
+        return await search_rules(client, q_clamped, skey, grade_int, top_k=5)
+    try:
+        rules = []
+        try:
+            rules = await asyncio.wait_for(_srch(subj_key), timeout=3.0)
+        except Exception as e:
+            rules = []
+            log.warning(f"/vdbtest primary timeout/fail: {e}")
+        if not rules and subj_key != subj_raw:
+            try:
+                rules = await asyncio.wait_for(_srch(subj_raw), timeout=3.0)
+            except Exception as e:
+                log.warning(f"/vdbtest fallback timeout/fail: {e}")
+                rules = []
+        if not rules:
+            return await update.message.reply_text("⚠️ Ничего не нашёл в ВБД по этому запросу.")
+        lines = []
+        for r in rules[:5]:
+            book = (r.get("book") or "").strip()
+            ch = (r.get("chapter") or "").strip()
+            pg = r.get("page")
+            brief = (r.get("rule_brief") or r.get("text") or r.get("rule") or "").strip()
+            meta = " · ".join([x for x in [book, ch, f"стр. {pg}" if pg else ""] if x])
+            lines.append(("— " + brief) + (f"
+   ({meta})" if meta else ""))
+        out = "
+".join(lines)[:3500]
+        return await update.message.reply_text(out or "⚠️ Пусто.")
+    except Exception as e:
+        log.exception("vdbtest")
+        return await update.message.reply_text(f"Ошибка ВБД: {e}")
+
+
 
     async def _srch(skey):
         return await search_rules(client, q_clamped, skey, grade_int, top_k=5)
@@ -1302,7 +1322,7 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
         await update.message.reply_text(msg + "\nПроверить баланс: /mystats")
 
 # ---------- Health + webhooks (карта/ЕРИП) + VDB search ----------
-class _Health(BaseHTTPRequestHandler):
+
     def _ok(self, body: bytes, ctype="text/plain; charset=utf-8"):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
@@ -1414,6 +1434,113 @@ async def set_commands_post_init(app: Application):
         await set_commands(app)
     except Exception as e:
         log.warning(f"set_commands failed: {e}")
+
+# ---------- Health + webhooks (карта/ЕРИП) + VDB search ----------
+class _Health(BaseHTTPRequestHandler):
+    def _ok(self, body: bytes, ctype="text/plain; charset=utf-8"):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _err(self, code: int, msg, ctype="text/plain; charset=utf-8"):
+        body = (msg if isinstance(msg, str) else json.dumps(msg, ensure_ascii=False)).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        try:
+            if self.path == "/":
+                return self._ok(b"ok")
+            if self.path == "/stats.json":
+                payload = json.dumps(stats_snapshot(), ensure_ascii=False).encode("utf-8")
+                return self._ok(payload, "application/json; charset=utf-8")
+            return self._err(404, "not found")
+        except Exception as e:
+            return self._err(500, f"error: {e}")
+
+    def do_POST(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            data = json.loads(raw.decode("utf-8") or "{}")
+            auth = self.headers.get("X-Auth", "")
+            path = self.path
+
+            # --- /vdb/search: прямой REST для sanity-тестов ---
+            if path == "/vdb/search":
+                if VDB_WEBHOOK_SECRET and auth != VDB_WEBHOOK_SECRET:
+                    return self._err(401, "bad auth")
+                q = str(data.get("q", "") or "").strip()
+                if not q:
+                    return self._err(400, {"ok": False, "error": "empty q"}, "application/json; charset=utf-8")
+                try:
+                    top_k = int(data.get("top_k", 5))
+                except Exception:
+                    top_k = 5
+                top_k = min(20, max(1, top_k))
+
+                subject_in = str(data.get("subject", "") or "").strip().lower()
+                grade_in = data.get("grade", None)
+                subj_key = subject_to_vdb_key(subject_in) if subject_in else "auto"
+                try:
+                    grade_int = int(grade_in) if grade_in is not None else 8
+                except Exception:
+                    grade_int = 8
+
+                q_clamped = clamp_words(q, 40)
+                try:
+                    rules = asyncio.run(search_rules(client, q_clamped, subj_key, grade_int, top_k=top_k))
+                    if not rules and subj_key != "auto":
+                        rules = asyncio.run(search_rules(client, q_clamped, subject_in or "auto", grade_int, top_k=top_k))
+                except Exception as e:
+                    return self._err(500, {"ok": False, "error": f"search failed: {e}"}, "application/json; charset=utf-8")
+
+                items = []
+                for r in (rules or []):
+                    items.append({
+                        "id": r.get("id"),
+                        "score": float(r.get("score", 0) or 0),
+                        "rule": r.get("rule_brief") or r.get("text") or r.get("rule") or "",
+                        "source": " · ".join([x for x in [
+                            (r.get("book") or ""), (r.get("chapter") or ""), f"стр. {r.get('page')}" if r.get('page') else ""
+                        ] if x]),
+                        "meta": {"book": r.get("book"), "chapter": r.get("chapter"), "page": r.get("page"),
+                                 "subject": subject_in or subj_key, "grade": grade_int},
+                    })
+                payload = {"ok": True, "count": len(items), "items": items}
+                return self._ok(json.dumps(payload, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+
+            if path == "/webhook/card":
+                if auth != CARD_WEBHOOK_SECRET or not CARD_WEBHOOK_SECRET:
+                    return self._err(401, "bad auth")
+                uid = int(data.get("user_id", 0) or 0)
+                kind = data.get("kind")
+                if not uid or not kind:
+                    return self._err(400, "bad payload")
+                msg = apply_payment_payload(uid, kind)
+                return self._ok(msg.encode("utf-8"))
+
+            if path == "/webhook/erip":
+                if auth != ERIP_WEBHOOK_SECRET or not ERIP_WEBHOOK_SECRET:
+                    return self._err(401, "bad auth")
+                uid = int(data.get("user_id", 0) or 0)
+                kind = data.get("kind")  # критично: строка целая
+                if not uid or not kind:
+                    return self._err(400, "bad payload")
+                msg = apply_payment_payload(uid, kind)
+                return self._ok(msg.encode("utf-8"))
+
+            return self._err(404, "not found")
+        except Exception as e:
+            log.exception("http-post")
+            return self._err(500, f"error: {e}")
+
+
 
 def main():
     try:
