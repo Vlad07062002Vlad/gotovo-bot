@@ -1,7 +1,15 @@
-# bot.py — R2 (очищено): 7 дней Pro, далее Free (4o-mini); bePaid (карта РБ/ЕРИП); VDB+Admin; OCR; метрики
-# Регион: BY. Оплаты: Telegram Stars + bePaid.
-# Важное: никаких "1-Pro в день" после триала, Pro только 7 дней новым.
-# Исправления: about_cmd (кавычки/многострочник), /vdb/search (таймаут/валидация), убраны дубли _Health/_run_health/vdbtest-хвост.
+# bot.py — R2 Final
+# 🇧🇾 Регион BY. Монетизация: Telegram Stars (заглушка-кнопка) + bePaid webhook (заглушка).
+# Особенности:
+# - AsyncOpenAI
+# - Free = gpt-4o-mini (только текст), лимит 10 задач/день после триала
+# - Pro = combo gpt-4o-mini / o4-mini / gpt-4o (текст + фото/OCR)
+# - 7-дневный триал Pro через pro_until (персист в SQLite, создаётся на первом /start)
+# - Админ = полный Pro без ограничений
+# - Follow-up: «ДА/НЕТ», 1 бесплатно в 15 минут, далее списание (free-лимит/кредит)
+# - Health server: GET /, GET /stats.json, POST /vdb/search
+# - bePaid webhook заглушка: POST /webhook/bepaid
+# - Без дублей, корректный post_init на builder (python-telegram-bot)
 
 import os, io, re, html, json, time, sqlite3, tempfile, logging, threading, asyncio
 from time import perf_counter
@@ -13,13 +21,13 @@ from typing import Optional
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("gotovo-bot")
 
-# ---------- ENV / конфиг ----------
+# ---------- ENV ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PORT = int(os.getenv("PORT", "8080"))
 
 TELEGRAM_STARS_ENABLED = os.getenv("TELEGRAM_STARS_ENABLED", "true").lower() == "true"
-TELEGRAM_PROVIDER_TOKEN = os.getenv("TELEGRAM_PROVIDER_TOKEN", "")  # для Stars (XTR)
+TELEGRAM_PROVIDER_TOKEN = os.getenv("TELEGRAM_PROVIDER_TOKEN", "")  # для Stars (XTR), если нужно
 
 # bePaid (единая витрина: карта РБ/ЕРИП внутри)
 BEPAID_CHECKOUT_URL = os.getenv("BEPAID_CHECKOUT_URL", "")
@@ -28,7 +36,7 @@ BEPAID_WEBHOOK_SECRET = os.getenv("BEPAID_WEBHOOK_SECRET", "")
 # ВБД-хук (админский sanity-тест)
 VDB_WEBHOOK_SECRET = os.getenv("VDB_WEBHOOK_SECRET", "")
 
-# Диски / БД / Метрики
+# Директории / БД / Метрики
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 DB_PATH = os.path.join(DATA_DIR, "app.db")
 METRICS_PATH = os.path.join(DATA_DIR, "metrics.json")
@@ -64,13 +72,13 @@ RENDER_TEX = _RENDER_TEX
 # ---------- Telegram ----------
 from telegram import (
     Update, BotCommand, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton,
-    LabeledPrice, PreCheckoutQuery, Message
+    Message
 )
 from telegram.constants import ChatAction
 from telegram.error import BadRequest
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, CallbackQueryHandler,
-    PreCheckoutQueryHandler, filters as f
+    filters as f
 )
 
 # ---------- OpenAI ----------
@@ -92,7 +100,7 @@ if not TELEGRAM_TOKEN:
 if not OPENAI_API_KEY:
     raise SystemExit("Нет OPENAI_API_KEY (fly secrets set OPENAI_API_KEY=...)")
 
-# ---------- ПАМЯТЬ (RAM) ----------
+# ---------- Предметы/состояния ----------
 SUBJECTS = {
     "математика","русский","английский","физика","химия","история","обществознание","биология",
     "информатика","география","литература","auto","беларуская мова","беларуская літаратура",
@@ -113,7 +121,7 @@ USER_STATE = defaultdict(lambda: None)
 USER_LANG = defaultdict(lambda: "ru")
 PRO_NEXT = defaultdict(lambda: False)
 
-# ---------- Follow-up контекст в локальной БД ----------
+# ---------- SQLite: follow-up контекст ----------
 def _db_followup():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -159,6 +167,80 @@ def mark_followup_used(uid: int):
 
 def in_free_window(ctx: dict | None) -> bool:
     return bool(ctx) and (int(time.time()) - int(ctx.get("ts", 0)) <= FOLLOWUP_FREE_WINDOW_SEC)
+
+# ---------- SQLite: план пользователя (pro_until, free-лимиты, кредиты) ----------
+def _db_plan():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS user_plan(
+            user_id INTEGER PRIMARY KEY,
+            pro_until INTEGER NOT NULL DEFAULT 0,
+            day INTEGER NOT NULL DEFAULT 0,
+            free_count INTEGER NOT NULL DEFAULT 0,
+            credits INTEGER NOT NULL DEFAULT 0,
+            sub_until INTEGER NOT NULL DEFAULT 0
+        )"""
+    )
+    return conn
+
+DAY = lambda: int(time.time() // 86400)
+FREE_LIMIT_PER_DAY = 10  # ← требование
+
+def _ensure_user_plan(uid: int) -> dict:
+    now = int(time.time())
+    with _db_plan() as db:
+        row = db.execute("SELECT user_id,pro_until,day,free_count,credits,sub_until FROM user_plan WHERE user_id=?", (uid,)).fetchone()
+        if row:
+            return {"user_id": row[0], "pro_until": row[1], "day": row[2], "free_count": row[3], "credits": row[4], "sub_until": row[5]}
+        # Первый визит → даём 7 дней Pro
+        pro_until = now + 7 * 24 * 3600
+        db.execute("INSERT INTO user_plan(user_id,pro_until,day,free_count,credits,sub_until) VALUES(?,?,?,?,?,?)",
+                   (uid, pro_until, DAY(), 0, 0, 0))
+        return {"user_id": uid, "pro_until": pro_until, "day": DAY(), "free_count": 0, "credits": 0, "sub_until": 0}
+
+def _roll_day(uid: int):
+    with _db_plan() as db:
+        row = db.execute("SELECT day FROM user_plan WHERE user_id=?", (uid,)).fetchone()
+        today = DAY()
+        if not row:
+            db.execute("INSERT OR IGNORE INTO user_plan(user_id,day) VALUES(?,?)", (uid, today))
+            return
+        if row[0] != today:
+            db.execute("UPDATE user_plan SET day=?, free_count=0 WHERE user_id=?", (today, uid))
+
+def plan_get(uid: int) -> dict:
+    _ensure_user_plan(uid)
+    _roll_day(uid)
+    with _db_plan() as db:
+        row = db.execute("SELECT pro_until,day,free_count,credits,sub_until FROM user_plan WHERE user_id=?", (uid,)).fetchone()
+    now = int(time.time())
+    pro_active = (row[0] > now) or (row[4] > now)
+    free_left = max(0, FREE_LIMIT_PER_DAY - int(row[2] or 0))
+    return {"pro_active": pro_active, "free_left_today": free_left, "pro_until": row[0], "credits": int(row[3] or 0), "sub_until": row[4]}
+
+def inc_free(uid: int):
+    with _db_plan() as db:
+        db.execute("UPDATE user_plan SET free_count = free_count + 1 WHERE user_id=?", (uid,))
+
+def dec_credit(uid: int) -> bool:
+    with _db_plan() as db:
+        row = db.execute("SELECT credits FROM user_plan WHERE user_id=?", (uid,)).fetchone()
+        if not row or int(row[0] or 0) <= 0:
+            return False
+        db.execute("UPDATE user_plan SET credits = credits - 1 WHERE user_id=?", (uid,))
+        return True
+
+def add_credits(uid: int, cnt: int):
+    with _db_plan() as db:
+        db.execute("INSERT INTO user_plan(user_id,credits) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET credits=credits+?",
+                   (uid, cnt, cnt))
+
+def activate_sub(uid: int, months: int = 1):
+    until = int(time.time()) + int(months * 30 * 24 * 3600)
+    with _db_plan() as db:
+        db.execute("INSERT INTO user_plan(user_id,sub_until) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET sub_until=?",
+                   (uid, until, until))
 
 # ---------- Клавиатура ----------
 def kb(uid: int) -> ReplyKeyboardMarkup:
@@ -235,7 +317,28 @@ def detect_lang(text: str) -> str:
     if lat > cyr * 1.2: return "en"
     return "ru"
 
-# ---------- Системный промпт: «разжеванный» ----------
+# ---------- Хелпер: эвристическая классификация предмета ----------
+SUBJECT_HINTS = [
+    ("математика", ("дроб", "уравн", "интеграл", "производн", "теорема", "логарифм", "тригоном")),
+    ("физика", ("ньютон", "сила", "энерг", "импульс", "напряж", "сопротивл", "кинетичес", "потенциал")),
+    ("химия", ("валент", "реакц", "кислот", "щелоч", "осад", "моль", "радикал", "раствор")),
+    ("биология", ("клетк", "ДНК", "РНК", "мейоз", "митоз", "организм", "фотосинт", "экосистем")),
+    ("информатика", ("алгоритм", "код", "python", "программа", "компил", "переменн", "сложност")),
+    ("география", ("материк", "климат", "широта", "долгота", "геосфер", "тектоник")),
+    ("история", ("революц", "импер", "корол", "войн", "сражен", "реформа")),
+    ("обществознание", ("конституц", "право", "обществ", "экономик", "политик", "культура")),
+    ("литература", ("образ", "герой", "композици", "троп", "эпитет", "метафор", "жанр")),
+    ("русский", ("деепричаст", "причаст", "синтакс", "морфем", "ударен", "орфограм")),
+    ("английский", ("present", "past", "future", "vocabulary", "grammar", "essay", "speaking")),
+]
+async def classify_subject(text: str) -> str:
+    t = (text or "").lower()
+    for subj, keys in SUBJECT_HINTS:
+        if any(k in t for k in keys):
+            return subj
+    return "auto"
+
+# ---------- Системный промпт ----------
 def sys_prompt(uid: int) -> str:
     subject = USER_SUBJECT[uid]; grade = USER_GRADE[uid]; parent = PARENT_MODE[uid]
     base = (
@@ -254,6 +357,7 @@ def sys_prompt(uid: int) -> str:
            if parent else "")
     return f"{base} {form_hint} {sub} {grd} {par}"
 
+# ---------- OCR pipeline ----------
 def _preprocess_image(img: Image.Image) -> Image.Image:
     img = ImageOps.exif_transpose(img).convert("L")
     img = ImageOps.autocontrast(img)
@@ -283,30 +387,32 @@ def ocr_image(img: Image.Image) -> str:
                 continue
     return ""
 
-# ---------- Гибридный роутер моделей ----------
-HEAVY_MARKERS = ("докажи","обоснуй","подробно","по шагам","поиндукции","уравнение","система",
-                 "дробь","производная","интеграл","доказать","программа","алгоритм","код")
+# ---------- Роутер моделей ----------
+HEAVY_MARKERS = ("докажи","обоснуй","подробно","по шагам","поиндукции","уравнен","система",
+                 "дроб","производн","интеграл","доказат","программа","алгоритм","код","теорем")
 
-def _local_select_model(prompt: str, mode: str) -> tuple[str, int, str]:
+def select_model(prompt: str, mode: str) -> tuple[str, int, str]:
     p = (prompt or "").lower()
-    if mode == "free":  # после 7 дней
-        return "gpt-4o-mini", 700, "4o-mini"
-    if mode == "pro":   # первые 7 дней, подписка или кредиты
+    if mode == "free":     # после триала — только текст
+        return "gpt-4o-mini", 800, "4o-mini"
+    if mode == "pro":      # триал/подписка/админ/кредиты
         long_input = len(p) > 600
         heavy = long_input or any(k in p for k in HEAVY_MARKERS)
-        if heavy: return "o4-mini", 1100, "o4-mini"
-        return "gpt-4o-mini", 900, "4o-mini"
-    return "gpt-4o-mini", 700, "4o-mini"
+        if heavy and len(p) > 1200:
+            return "gpt-4o", 1100, "4o"          # самые тяжёлые
+        if heavy:
+            return "o4-mini", 1100, "o4-mini"    # сложные, но не запредельно
+        return "gpt-4o-mini", 900, "4o-mini"     # обычные Pro
+    return "gpt-4o-mini", 800, "4o-mini"
 
-select_model = _local_select_model  # может быть переопределён сервисом
-
+# ---------- Вызовы LLM ----------
 async def call_model(uid: int, user_text: str, mode: str) -> str:
     lang = detect_lang(user_text)
     USER_LANG[uid] = lang
     model, max_out, tag = select_model(user_text, mode)
     sys = sys_prompt(uid)
 
-    # ----- ВБД (RAG) -----
+    # ВБД (RAG)
     vdb_hints = []
     try:
         subj_key = subject_to_vdb_key(USER_SUBJECT[uid])
@@ -331,19 +437,18 @@ async def call_model(uid: int, user_text: str, mode: str) -> str:
         log.warning(f"VDB block error: {e}")
 
     vdb_context = ("\n\n[ВБД-памятка: используй только как справку, без ссылок на книги]\n" + "\n".join(vdb_hints)) if vdb_hints else ""
-
     content = (
         "Реши задание. Сначала <b>Ответы</b>, затем <b>Пояснение</b> простым русским. "
         f"Текст/условие:\n{user_text}" + vdb_context
     )
 
-    # ----- LLM-вызов -----
+    # LLM-вызов
     t0 = perf_counter()
     try:
         resp = await client.chat.completions.create(
             model=model,
             messages=[{"role": "system", "content": sys}, {"role": "user", "content": content}],
-            temperature=0.25 if mode in {"free"} else 0.3,
+            temperature=0.25 if mode == "free" else 0.3,
             max_tokens=max_out,
         )
         out_text = (resp.choices[0].message.content or "").strip()
@@ -352,15 +457,11 @@ async def call_model(uid: int, user_text: str, mode: str) -> str:
         out_text = "❌ Не получилось получить ответ от модели. Попробуй ещё раз."
     dt = perf_counter() - t0
     log.info(f"LLM model={model} tag={tag} mode={mode} dt={dt:.2f}s")
-
-    # метрики
     try:
         st = _get_user_stats(uid)
-        st.gpt_calls += 1
-        st.gpt_time_sum += float(dt)
+        st.gpt_calls += 1; st.gpt_time_sum += float(dt)
     except Exception:
         pass
-
     return out_text
 
 async def call_model_followup(uid: int, prev_task: str, prev_answer: str, follow_q: str, mode_tag: str) -> str:
@@ -378,7 +479,7 @@ async def call_model_followup(uid: int, prev_task: str, prev_answer: str, follow
         resp = await client.chat.completions.create(
             model=model,
             messages=[{"role": "system", "content": sys}, {"role": "user", "content": prompt}],
-            temperature=0.25 if mode_tag in {"free"} else 0.3,
+            temperature=0.25 if mode_tag == "free" else 0.3,
             max_tokens=min(600, max_out),
         )
         out = (resp.choices[0].message.content or "").strip()
@@ -530,48 +631,7 @@ def del_admin(uid: int) -> bool:
     with _db_admins() as db: db.execute("DELETE FROM admin_users WHERE user_id=?", (uid,))
     return True
 
-# ---------- Монетизация (stubs) ----------
-# Новые правила:
-# - Первые 7 дней с момента first_seen — Pro бесплатно (sub_active=True).
-# - После 7 дней: только Free (3/день текст), никакого Trial Pro.
-_DAY = lambda: int(time.time() // 86400)
-_COUNTS = defaultdict(lambda: {"day": _DAY(), "free": 0})
-def _roll(uid: int):
-    d = _COUNTS[uid]
-    if d["day"] != _DAY():
-        d["day"] = _DAY(); d["free"] = 0
-
-def _is_new_user_pro(uid: int) -> bool:
-    st = _get_user_stats(uid)
-    return (time.time() - st.first_seen) < 7 * 24 * 3600
-
-def get_user_plan(uid: int):
-    _roll(uid)
-    sub_active = _is_new_user_pro(uid)
-    left_free = max(0, 3 - _COUNTS[uid]["free"])
-    return {
-        "free_left_today": left_free,
-        "sub_active": sub_active,
-        "sub_left_month": 0,   # если подключим реальную подписку — заполним
-        "credits": 0
-    }
-
-def consume_request(uid: int, need_pro: bool, allow_trial: bool = False):
-    _roll(uid)
-    if need_pro:
-        if _is_new_user_pro(uid):  # 7 дней Pro
-            return True, "pro", ""
-        # иначе нужен платёж: подписка/кредиты (в стабе их нет)
-        return False, "free", "нужен Pro (подписка/кредиты)"
-    # free-запрос
-    if _COUNTS[uid]["free"] < 3:
-        _COUNTS[uid]["free"] += 1
-        return True, "free", ""
-    return False, "free", "исчерпан дневной лимит Free"
-
-def add_credits(uid: int, cnt: int): return 0
-def activate_sub(uid: int, months: int): return False
-
+# ---------- Монетизация: consume (админ — всегда Pro) ----------
 def build_buy_keyboard(stars_enabled: bool, bepaid_url: str | None):
     rows = []
     if stars_enabled:
@@ -582,17 +642,22 @@ def build_buy_keyboard(stars_enabled: bool, bepaid_url: str | None):
         rows = [[InlineKeyboardButton("Скоро доступна оплата", callback_data="noop")]]
     return InlineKeyboardMarkup(rows)
 
-def apply_payment_payload(uid: int, kind: str) -> str:
-    return f"✅ Платёж принят: {kind}. Баланс обновлён (демо)."
-
-def _stars_amount(payload: str) -> int:
-    defaults = {
-        "CREDITS_50": int(os.getenv("PRICE_CREDITS_50_XTR", "60")),
-        "CREDITS_200": int(os.getenv("PRICE_CREDITS_200_XTR", "220")),
-        "CREDITS_1000": int(os.getenv("PRICE_CREDITS_1000_XTR", "990")),
-        "SUB_MONTH": int(os.getenv("PRICE_SUB_MONTH_XTR", "490")),
-    }
-    return defaults.get(payload, 100)
+def consume_request(uid: int, need_pro: bool):
+    if is_admin(uid):
+        return True, "pro", ""
+    plan = plan_get(uid)
+    if need_pro:
+        if plan["pro_active"]:
+            return True, "pro", ""
+        # пробуем кредит
+        if dec_credit(uid):
+            return True, "pro", ""
+        return False, "free", "нужен Pro (подписка/кредиты)"
+    # Free
+    if plan["free_left_today"] > 0:
+        inc_free(uid)
+        return True, "free", ""
+    return False, "free", "исчерпан дневной лимит Free"
 
 # ---------- Команды / меню ----------
 async def set_commands(app: Application):
@@ -624,19 +689,37 @@ async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     st = _get_user_stats(uid, update)
-    if _is_new_user_pro(uid):
+
+    # Гарантируем наличие записи плана (создаст trial pro_until при первом заходе)
+    plan = plan_get(uid)
+
+    # Дисклеймер и приветствие
+    disclaimer = (
+        "⚠️ <b>Важно</b>: бот создан для подготовки и понимания материала.\n"
+        "Не рекомендуется использовать его <u>во время уроков, контрольных и самостоятельных</u>."
+        " В школе — слушай преподавателя, записывай шаги решения и тренируйся, а я помогу разложить сложное на простые шаги."
+    )
+    if plan["pro_active"] and not is_admin(uid):
+        # Новичок в триале (или активная подписка)
+        until = time.strftime("%Y-%m-%d %H:%M", time.localtime(plan["pro_until"])) if plan["pro_until"] else "активна"
         banner = (
             "👋 Привет! Я — <b>Готово!</b>\n"
-            "🎁 <b>7 дней Pro бесплатно</b> для новых пользователей: сложные задачи, фото/сканы, приоритет.\n"
-            "После — бесплатный простой режим (текст, GPT-4o-mini).\n\n"
-            "Пиши задание или жми кнопки ниже."
+            f"🎁 <b>Пробная Pro-подписка активна 7 дней</b> (до <b>{until}</b>): сложные задачи, фото/сканы, приоритет.\n"
+            "После триала — бесплатный режим: 10 текстовых задач/день (GPT-4o-mini).\n\n"
+            f"{disclaimer}\n\nПиши задание или жми кнопки ниже."
+        )
+    elif is_admin(uid):
+        banner = (
+            "👋 Привет, админ! У тебя <b>полный Pro без ограничений</b>.\n"
+            "Доступны текст+фото/OCR, приоритетные модели и админ-панель.\n\n"
+            f"{disclaimer}"
         )
     else:
         banner = (
             "👋 Привет! Я — <b>Готово!</b>\n"
-            "Сейчас действует бесплатный простой режим (3 текста/день на GPT-4o-mini).\n"
-            "Хочешь Pro (сложные задачи, фото) — оформи оплату.\n\n"
-            "Пиши задание или жми кнопки ниже."
+            "Сейчас действует <b>бесплатный режим</b>: 10 текстовых задач/день на GPT-4o-mini.\n"
+            "Pro даёт сложные задачи, фото/сканы и приоритет моделей.\n\n"
+            f"{disclaimer}\n\nПиши задание или жми кнопки ниже."
         )
     await safe_reply_html(update.message, banner, reply_markup=kb(uid))
 
@@ -649,11 +732,11 @@ async def about_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • 5–11 классы: решаю задачи и объясняю «по-людски». Сначала <b>Ответы</b>, потом <b>Пояснение</b> шагами.
 • <b>Родителям</b>: памятка — что спросить у ребёнка, на что смотреть, мини-тренировка.
 • Формулы/чертежи: аккуратно, где можно — LaTeX. Фото заданий — в Pro.
-• Модели: Free — GPT-4o-mini; Pro — o4-mini/4o по необходимости.
+• Модели: Free — gpt-4o-mini; Pro — o4-mini/gpt-4o при необходимости.
 • Оплата: Telegram Stars + <b>bePaid</b> (карта РБ, ЕРИП).
 
-<b>Новые пользователи</b>: 7 дней Pro бесплатно. Затем — бесплатный простой режим (GPT-4o-mini).
-Чтобы начать — пришли задание текстом или фото. Если «первый класс как институт 😂» — разложу на <i>микро-шаги</i>."""
+<b>Триал Pro 7 дней</b> выдаётся при первом запуске. Затем — Free: 10 текстовых задач/день.
+<b>Важно:</b> бот для подготовки. Не пользуйтесь во время уроков/контрольных — в школе слушаем учителя, а бот — для тренировки дома."""
     await safe_reply_html(update.message, txt, reply_markup=kb(uid))
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -689,13 +772,18 @@ async def parent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def free_vs_pro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    plan = get_user_plan(uid)
-    msg = (
-        "🔹 <b>Free</b>: 3 текстовых запроса/день (GPT-4o-mini).\n"
-        "🔸 <b>Pro</b>: сложные задачи, фото/сканы, приоритет; модели o4-mini/4o по необходимости.\n"
-        f"🎁 <b>Статус</b>: {'Первые 7 дней — Pro бесплатно' if plan['sub_active'] else 'Сейчас Free. Pro доступен по оплате.'}\n\n"
-        f"Сегодня осталось: Free {plan['free_left_today']}."
-    )
+    plan = plan_get(uid)
+    if is_admin(uid):
+        msg = "🔸 <b>Статус</b>: Админ (полный Pro, без ограничений)."
+    elif plan["pro_active"]:
+        until = time.strftime("%Y-%m-%d %H:%M", time.localtime(plan["pro_until"])) if plan["pro_until"] else "активно"
+        msg = f"🔸 <b>Pro</b> активно (до {until}). Фото/сканы доступны. Сегодня Free не ограничен Pro."
+    else:
+        msg = (
+            "🔹 <b>Free</b>: 10 текстовых задач/день (gpt-4o-mini).\n"
+            "🔸 <b>Pro</b>: сложные задачи, фото/сканы, приоритетные модели.\n"
+            f"Сегодня осталось Free: {plan['free_left_today']}."
+        )
     await safe_reply_html(update.message, msg, reply_markup=kb(uid))
 
 async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -714,7 +802,7 @@ async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("🧠 Что объяснить/решить? Напиши одной фразой.", reply_markup=kb(uid))
 
     need_pro = PRO_NEXT[uid] or False
-    ok, mode, reason = consume_request(uid, need_pro=need_pro, allow_trial=False)
+    ok, mode, reason = consume_request(uid, need_pro=need_pro)
     if not ok:
         kb_i = build_buy_keyboard(TELEGRAM_STARS_ENABLED and (TELEGRAM_PROVIDER_TOKEN == ""), BEPAID_CHECKOUT_URL or None)
         return await update.message.reply_text(f"Нужен Pro: {reason}. Оформи оплату:", reply_markup=kb_i)
@@ -753,8 +841,9 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USER_STATE[uid] = "AWAIT_ESSAY"
         return await update.message.reply_text("📝 Тема сочинения?", reply_markup=kb(uid))
 
-    need_pro = PRO_NEXT[uid] or _is_new_user_pro(uid)  # сочинение лучше в pro, но если нет — пойдём как free
-    ok, mode, reason = consume_request(uid, need_pro=need_pro, allow_trial=False)
+    # Сочинение можно и в free, но в Pro лучше качество → спросим Pro, если включён Pro (триал/подписка)
+    need_pro = PRO_NEXT[uid] or plan_get(uid)["pro_active"]
+    ok, mode, reason = consume_request(uid, need_pro=need_pro)
     if not ok:
         kb_i = build_buy_keyboard(TELEGRAM_STARS_ENABLED and (TELEGRAM_PROVIDER_TOKEN == ""), BEPAID_CHECKOUT_URL or None)
         return await update.message.reply_text(f"Нужен Pro: {reason}. Оформи оплату:", reply_markup=kb_i)
@@ -783,7 +872,7 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    ok, mode, reason = consume_request(uid, need_pro=True, allow_trial=False)
+    ok, mode, reason = consume_request(uid, need_pro=True)
     if not ok:
         kb_i = build_buy_keyboard(TELEGRAM_STARS_ENABLED and (TELEGRAM_PROVIDER_TOKEN == ""), BEPAID_CHECKOUT_URL or None)
         return await update.message.reply_text("Фото-решение доступно в Pro. Выбери оплату:", reply_markup=kb_i)
@@ -855,8 +944,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if txt in {"🧾 моя статистика","моя статистика"}:
         return await mystats_cmd(update, context)
     if txt == "⭐ pro (след. запрос)":
-        plan = get_user_plan(uid)
-        if not plan["sub_active"]:
+        plan = plan_get(uid)
+        if not (plan["pro_active"] or is_admin(uid)):
             kb_i = build_buy_keyboard(TELEGRAM_STARS_ENABLED and (TELEGRAM_PROVIDER_TOKEN == ""), BEPAID_CHECKOUT_URL or None)
             return await update.message.reply_text("Pro доступен по оплате. Выбери способ:", reply_markup=kb_i)
         PRO_NEXT[uid] = True
@@ -902,7 +991,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Платное уточнение
     if state in {"AWAIT_FOLLOWUP_PAID", "AWAIT_FOLLOWUP_NEXT"}:
         ctx = get_followup_context(uid)
-        ok, mode, reason = consume_request(uid, need_pro=False, allow_trial=False)
+        ok, mode, reason = consume_request(uid, need_pro=False)
         if not ok:
             kb_i = build_buy_keyboard(TELEGRAM_STARS_ENABLED and (TELEGRAM_PROVIDER_TOKEN == ""), BEPAID_CHECKOUT_URL or None)
             USER_STATE[uid] = None
@@ -938,9 +1027,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.args = [raw]
         return await essay_cmd(update, context)
 
-    # обычный текст — решаем как Free/Pro в зависимости от статуса и флага
+    # Обычный текст — решаем как Free/Pro в зависимости от статуса и флага
     need_pro = PRO_NEXT[uid]
-    ok, mode, reason = consume_request(uid, need_pro=need_pro, allow_trial=False)
+    ok, mode, reason = consume_request(uid, need_pro=need_pro)
     if not ok:
         kb_i = build_buy_keyboard(TELEGRAM_STARS_ENABLED and (TELEGRAM_PROVIDER_TOKEN == ""), BEPAID_CHECKOUT_URL or None)
         return await update.message.reply_text(f"Нужен Pro: {reason}. Оформи оплату:", reply_markup=kb_i)
@@ -948,20 +1037,22 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.args = [raw]
     return await explain_cmd(update, context)
 
-# ---------- Мои метрики ----------
+# ---------- /mystats ----------
 async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     try:
-        # если будет внешний сервис — обернём to_thread
-        plan = get_user_plan(uid)
-        s_today = {"free": 3 - plan["free_left_today"], "credit": 0, "sub": 1 if plan["sub_active"] else 0}
+        plan = plan_get(uid)
+        if is_admin(uid):
+            desc = "Админ: полный Pro без ограничений."
+        elif plan["pro_active"]:
+            until = time.strftime("%Y-%m-%d %H:%M", time.localtime(plan["pro_until"])) if plan["pro_until"] else "активно"
+            desc = f"Pro активно (до {until})."
+        else:
+            desc = f"Free. Осталось сегодня: {plan['free_left_today']}."
     except Exception as e:
         log.warning(f"/mystats fail: {e}")
-        s_today = {"free": 0, "credit": 0, "sub": 0}
-    await update.message.reply_text(
-        f"Сегодня: free {s_today['free']}, sub {'1' if s_today['sub'] else '0'}, credit {s_today['credit']}",
-        reply_markup=kb(uid),
-    )
+        desc = "Не удалось собрать статистику."
+    await update.message.reply_text(desc, reply_markup=kb(uid))
 
 # ---------- /stats (админ) ----------
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1108,7 +1199,7 @@ async def sudo_del_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.info(f"ADMIN: {uid} removed admin {target}")
     await update.message.reply_text(f"Готово. Удалён admin: {target}")
 
-# ---------- ВБД: тестовый поиск (админ) — БЕЗ дублей ----------
+# ---------- ВБД: тестовый поиск ----------
 async def vdbtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_admin(uid):
@@ -1153,12 +1244,7 @@ async def vdbtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("vdbtest")
         return await update.message.reply_text(f"Ошибка ВБД: {e}")
 
-# =========[ БЛОК 6/6 — ФИНАЛ ]=================================================
-# Платежи: Stars + bePaid (карта РБ/ЕРИП внутри bePaid).
-# Health-сервер: GET /, GET /stats.json, POST /vdb/search, POST /webhook/bepaid.
-# ЕДИНСТВЕННЫЕ версии on_error/_Health/_HealthThread/_start_health_and_metrics/_register_handlers/main.
-
-# --- Единый error-handler телеграм-бота ---
+# ========= HEALTH / WEBHOOKS =========
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     try:
         log.exception("Unhandled error in handler", exc_info=context.error)
@@ -1167,7 +1253,6 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-# --- Колбэк для Telegram Stars (кнопка в /buy) ---
 async def on_buy_stars_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1176,7 +1261,6 @@ async def on_buy_stars_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "После подтверждения статус обновится автоматически."
     )
 
-# --- Health + webhooks (bePaid) + VDB search ---
 class _Health(BaseHTTPRequestHandler):
     def _ok(self, body: bytes, ctype="text/plain; charset=utf-8"):
         self.send_response(200)
@@ -1219,7 +1303,7 @@ class _Health(BaseHTTPRequestHandler):
             auth = self.headers.get("X-Auth", "")
             path = self.path
 
-            # --- /vdb/search: безопасный поиск через event loop health-потока ---
+            # /vdb/search
             if path == "/vdb/search":
                 if VDB_WEBHOOK_SECRET and auth != VDB_WEBHOOK_SECRET:
                     return self._err(401, {"ok": False, "error": "bad auth"})
@@ -1278,12 +1362,12 @@ class _Health(BaseHTTPRequestHandler):
                     return self._err(504, {"ok": False, "error": f"timeout: {e}"})
                 return self._json(200, res)
 
-            # --- Webhook bePaid (единая витрина: карта РБ/ЕРИП внутри) ---
+            # /webhook/bepaid — заглушка
             if path == "/webhook/bepaid":
                 if BEPAID_WEBHOOK_SECRET and auth != BEPAID_WEBHOOK_SECRET:
                     return self._err(401, {"ok": False, "error": "bad auth"})
-                # TODO: отметить оплату (активация подписки/кредитов) — в MVP просто логируем:
                 log.info("bePaid webhook: %s", data)
+                # TODO: здесь отметить оплату (credits/sub). Пока просто 200 OK:
                 return self._json(200, {"ok": True})
 
             return self._err(404, "not found")
@@ -1291,7 +1375,6 @@ class _Health(BaseHTTPRequestHandler):
             log.exception("http-post")
             return self._err(500, {"ok": False, "error": f"{e}"})
 
-# --- Отдельный поток под health-сервер с собственным event loop ---
 class _HealthThread(threading.Thread):
     daemon = True
     def __init__(self, port: int):
@@ -1303,18 +1386,17 @@ class _HealthThread(threading.Thread):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         httpd = HTTPServer(("0.0.0.0", self.port), _Health)
-        httpd.loop = self.loop  # пробрасываем loop в handler
+        httpd.loop = self.loop  # проброс event loop в handler
         log.info("Health server on 0.0.0.0:%s", self.port)
         httpd.serve_forever()
 
-# --- Старт health и авто-сейва метрик ---
 def _start_health_and_metrics():
     port = int(os.getenv("HEALTH_PORT", os.getenv("PORT", "8080")))
     ht = _HealthThread(port); ht.start()
     threading.Thread(target=_stats_autosave_loop, name="stats-autosave", daemon=True).start()
     return ht
 
-# --- Регистрация всех хэндлеров (ЕДИНСТВЕННАЯ версия) ---
+# ---------- Регистрация хэндлеров ----------
 def _register_handlers(app: Application):
     # Команды
     app.add_handler(CommandHandler("start", start_cmd))
@@ -1347,14 +1429,14 @@ def _register_handlers(app: Application):
     # Ошибки
     app.add_error_handler(on_error)
 
-# --- Пост-инициализация: корректная установка /commands после старта лупа ---
+# ---------- post_init: строго в builder ----------
 async def _post_init(app: Application):
     try:
         await set_commands(app)
     except Exception as e:
         log.warning(f"set_commands failed: {e}")
 
-# --- MAIN (ЕДИНСТВЕННАЯ версия) ---
+# ---------- MAIN ----------
 def main():
     if not TELEGRAM_TOKEN:
         raise SystemExit("Нет TELEGRAM_TOKEN (fly secrets set TELEGRAM_TOKEN=...)")
@@ -1366,16 +1448,14 @@ def main():
     except Exception as e:
         log.warning(f"stats/health start warn: {e}")
 
-    # Telegram App — ВАЖНО: post_init ставим на builder, НЕ в run_polling
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
         .concurrent_updates(True)
-        .post_init(_post_init)   # <<< вот так правильно для твоей версии PTB
+        .post_init(_post_init)   # правильное место для PTB
         .build()
     )
 
-    # Хэндлеры
     _register_handlers(app)
 
     log.info("Bot is starting (long-polling). Health on %s", os.getenv("HEALTH_PORT", os.getenv("PORT", "8080")))
@@ -1383,7 +1463,6 @@ def main():
         close_loop=False,
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
-        # !! Никакого post_init здесь быть не должно, иначе TypeError в твоей версии PTB
     )
 
 if __name__ == "__main__":
