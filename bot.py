@@ -1,4 +1,4 @@
-# bot.py — R2 Final
+# bot.py — R2 Final CLEAN
 # 🇧🇾 Регион BY. Монетизация: Telegram Stars (заглушка-кнопка) + bePaid webhook (заглушка).
 # Особенности:
 # - AsyncOpenAI
@@ -90,7 +90,10 @@ client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT, max_retries
 from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 import pytesseract
 from pytesseract import TesseractError
-TESS_LANGS_DEFAULT = "rus+bel+eng+deu+fra"
+# === Анти-OOM настройки изображений ===
+Image.MAX_IMAGE_PIXELS = 24_000_000  # ~24 мегапикселя
+MAX_IMAGE_BYTES = 8 * 1024 * 1024    # 8 МБ
+TESS_LANGS_DEFAULT = "rus+eng"
 TESS_LANGS = os.getenv("TESS_LANGS", TESS_LANGS_DEFAULT)
 TESS_CONFIG = os.getenv("TESS_CONFIG", "--oem 3 --psm 6 -c preserve_interword_spaces=1")
 
@@ -359,30 +362,27 @@ def sys_prompt(uid: int) -> str:
 
 # ---------- OCR pipeline ----------
 def _preprocess_image(img: Image.Image) -> Image.Image:
-    img = ImageOps.exif_transpose(img).convert("L")
-    img = ImageOps.autocontrast(img)
-    img = img.filter(ImageFilter.MedianFilter(size=3))
-    img = ImageEnhance.Sharpness(img).enhance(1.2)
-    max_w = 1800
-    if img.width < max_w:
-        scale = min(max_w / img.width, 3.0)
+    img = ImageOps.exif_transpose(img)
+    max_side = 1800
+    if max(img.width, img.height) > max_side:
+        scale = max_side / max(img.width, img.height)
         img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+    img = img.convert("L")
+    img = ImageOps.autocontrast(img)
+    img = ImageEnhance.Sharpness(img).enhance(1.1)
     return img
 
 def ocr_image(img: Image.Image) -> str:
     base = ImageOps.exif_transpose(img)
-    langs_chain = ([TESS_LANGS, "rus+bel+eng", "rus+eng", "rus", "bel", "eng", "deu", "fra"] if TESS_LANGS
-                   else ["rus+bel+eng", "rus", "eng"])
-    tried = set()
-    for angle in [0, 90, 180, 270]:
-        if angle in tried: continue
-        tried.add(angle)
+    langs_chain = [TESS_LANGS, "rus", "eng", "bel"] if TESS_LANGS else ["rus", "eng", "bel"]
+    for angle in (0, 90, 180, 270):
         rot = base.rotate(-angle, expand=True)
         p = _preprocess_image(rot)
         for langs in langs_chain:
             try:
                 txt = pytesseract.image_to_string(p, lang=langs, config=TESS_CONFIG)
-                if txt and txt.strip(): return txt.strip()
+                if txt and txt.strip():
+                    return txt.strip()
             except TesseractError:
                 continue
     return ""
@@ -393,22 +393,21 @@ HEAVY_MARKERS = ("докажи","обоснуй","подробно","по шаг
 
 def select_model(prompt: str, mode: str) -> tuple[str, int, str]:
     p = (prompt or "").lower()
-    if mode == "free":     # после триала — только текст
+    if mode == "free":
         return "gpt-4o-mini", 800, "4o-mini"
-    if mode == "pro":      # триал/подписка/админ/кредиты
+    if mode == "pro":
         long_input = len(p) > 600
         heavy = long_input or any(k in p for k in HEAVY_MARKERS)
         if heavy and len(p) > 1200:
-            return "gpt-4o", 1100, "4o"          # самые тяжёлые
+            return "gpt-4o", 1100, "4o"
         if heavy:
-            return "o4-mini", 1100, "o4-mini"    # сложные, но не запредельно
-        return "gpt-4o-mini", 900, "4o-mini"     # обычные Pro
+            return "o4-mini", 1100, "o4-mini"
+        return "gpt-4o-mini", 900, "4o-mini"
     return "gpt-4o-mini", 800, "4o-mini"
 
 # ---------- Вызовы LLM ----------
 async def call_model(uid: int, user_text: str, mode: str) -> str:
-    lang = detect_lang(user_text)
-    USER_LANG[uid] = lang
+    lang = detect_lang(user_text); USER_LANG[uid] = lang
     model, max_out, tag = select_model(user_text, mode)
     sys = sys_prompt(uid)
 
@@ -418,7 +417,6 @@ async def call_model(uid: int, user_text: str, mode: str) -> str:
         subj_key = subject_to_vdb_key(USER_SUBJECT[uid])
         grade_int = int(USER_GRADE[uid]) if str(USER_GRADE[uid]).isdigit() else 8
         query_for_vdb = clamp_words(user_text, 40)
-
         async def _srch(skey): return await search_rules(client, query_for_vdb, skey, grade_int)
         try:
             rules = await asyncio.wait_for(_srch(subj_key), timeout=3.0)
@@ -442,7 +440,6 @@ async def call_model(uid: int, user_text: str, mode: str) -> str:
         f"Текст/условие:\n{user_text}" + vdb_context
     )
 
-    # LLM-вызов
     t0 = perf_counter()
     try:
         resp = await client.chat.completions.create(
@@ -458,8 +455,7 @@ async def call_model(uid: int, user_text: str, mode: str) -> str:
     dt = perf_counter() - t0
     log.info(f"LLM model={model} tag={tag} mode={mode} dt={dt:.2f}s")
     try:
-        st = _get_user_stats(uid)
-        st.gpt_calls += 1; st.gpt_time_sum += float(dt)
+        st = _get_user_stats(uid); st.gpt_calls += 1; st.gpt_time_sum += float(dt)
     except Exception:
         pass
     return out_text
@@ -649,16 +645,13 @@ def consume_request(uid: int, need_pro: bool):
     if need_pro:
         if plan["pro_active"]:
             return True, "pro", ""
-        # пробуем кредит
         if dec_credit(uid):
             return True, "pro", ""
         return False, "free", "нужен Pro (подписка/кредиты)"
-    # Free
     if plan["free_left_today"] > 0:
         inc_free(uid)
         return True, "free", ""
     return False, "free", "исчерпан дневной лимит Free"
-
 # ---------- Команды / меню ----------
 async def set_commands(app: Application):
     await app.bot.set_my_commands(
@@ -700,7 +693,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         " В школе — слушай преподавателя, записывай шаги решения и тренируйся, а я помогу разложить сложное на простые шаги."
     )
     if plan["pro_active"] and not is_admin(uid):
-        # Новичок в триале (или активная подписка)
         until = time.strftime("%Y-%m-%d %H:%M", time.localtime(plan["pro_until"])) if plan["pro_until"] else "активна"
         banner = (
             "👋 Привет! Я — <b>Готово!</b>\n"
@@ -806,7 +798,7 @@ async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ok:
         kb_i = build_buy_keyboard(TELEGRAM_STARS_ENABLED and (TELEGRAM_PROVIDER_TOKEN == ""), BEPAID_CHECKOUT_URL or None)
         return await update.message.reply_text(f"Нужен Pro: {reason}. Оформи оплату:", reply_markup=kb_i)
-    PRO_NEXT[uid] = False  # сбрасываем флаг
+    PRO_NEXT[uid] = False
 
     if USER_SUBJECT[uid] == "auto":
         subj = await classify_subject(text)
@@ -841,7 +833,6 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USER_STATE[uid] = "AWAIT_ESSAY"
         return await update.message.reply_text("📝 Тема сочинения?", reply_markup=kb(uid))
 
-    # Сочинение можно и в free, но в Pro лучше качество → спросим Pro, если включён Pro (триал/подписка)
     need_pro = PRO_NEXT[uid] or plan_get(uid)["pro_active"]
     ok, mode, reason = consume_request(uid, need_pro=need_pro)
     if not ok:
@@ -872,57 +863,88 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+
+    # Фото-решение только в Pro (включая триал/подписку/админа/кредиты)
     ok, mode, reason = consume_request(uid, need_pro=True)
     if not ok:
-        kb_i = build_buy_keyboard(TELEGRAM_STARS_ENABLED and (TELEGRAM_PROVIDER_TOKEN == ""), BEPAID_CHECKOUT_URL or None)
-        return await update.message.reply_text("Фото-решение доступно в Pro. Выбери оплату:", reply_markup=kb_i)
+        kb_i = build_buy_keyboard(
+            stars_enabled=TELEGRAM_STARS_ENABLED and (TELEGRAM_PROVIDER_TOKEN == ""),
+            bepaid_url=BEPAID_CHECKOUT_URL or None,
+        )
+        return await update.message.reply_text(
+            "Фото/сканы доступны в Pro. Выбери способ оплаты:",
+            reply_markup=kb_i
+        )
 
     spinner_finish, spinner_set = await start_spinner(update, context, "Обрабатываю фото…")
     try:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
+
         tg_file = None
         if update.message.photo:
             tg_file = await update.message.photo[-1].get_file()
         elif update.message.document and str(update.message.document.mime_type or "").startswith("image/"):
             tg_file = await update.message.document.get_file()
         else:
-            raise ValueError("No image")
+            raise ValueError("Не найдено изображение")
+
         data = await tg_file.download_as_bytearray()
-        _get_user_stats(uid).bytes_images_in += len(data)
+        if len(data) > MAX_IMAGE_BYTES:
+            return await update.message.reply_text(
+                "Файл слишком большой (> 8 МБ). Пожалуйста, сожми изображение или сделай фото покрупнее и чётче.",
+                reply_markup=kb(uid)
+            )
+
+        st = _get_user_stats(uid); st.bytes_images_in += len(data)
         img = Image.open(io.BytesIO(data))
 
         spinner_set("Распознаю текст…")
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         ocr_text = ocr_image(img)
-        if ocr_text.strip():
-            _get_user_stats(uid).ocr_ok += 1
-        else:
-            _get_user_stats(uid).ocr_fail += 1
-            return await update.message.reply_text("Не удалось распознать текст. Попробуй переснять или напиши текстом.", reply_markup=kb(uid))
+
+        if not (ocr_text and ocr_text.strip()):
+            st.ocr_fail += 1
+            return await update.message.reply_text(
+                "Не удалось распознать текст на фото. Попробуй переснять ближе, без бликов и с хорошим освещением — или пришли текстом.",
+                reply_markup=kb(uid)
+            )
+
+        st.ocr_ok += 1
 
         if USER_SUBJECT[uid] == "auto":
             subj = await classify_subject(ocr_text)
             if subj in SUBJECTS:
                 USER_SUBJECT[uid] = subj
 
-        _get_user_stats(uid).kinds["solve_photo"] += 1
+        st.kinds["solve_photo"] += 1
 
         spinner_set("Решаю…")
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         out = await call_model(uid, ocr_text[:4000], mode=mode)
+
         await reply_with_formulas(update.message, out, reply_markup=kb(uid))
         set_followup_context(uid, ocr_text[:800], out)
+
         USER_STATE[uid] = "AWAIT_FOLLOWUP_YN"
         keyboard = ReplyKeyboardMarkup([["Да", "Нет"]], resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text(
             "Нужно уточнение к решению?\n"
-            "ℹ️ <b>1 уточнение — бесплатно в течение 15 минут</b>. Следующие — со списанием.",
+            "ℹ️ <b>1 уточнение — бесплатно в течение 15 минут</b>. Дальше уточнения списывают лимит/кредит.",
             reply_markup=keyboard,
         )
+
     except Exception as e:
-        log.exception("photo")
-        keyboard = ReplyKeyboardMarkup([["📸 Решить по фото", "✍️ Напишу текстом"]], resize_keyboard=True, one_time_keyboard=True)
-        await update.message.reply_text("Не получилось обработать фото. Попробуй ещё раз или напиши текстом:", reply_markup=keyboard)
+        log.exception("handle_photo")
         USER_STATE[uid] = "AWAIT_TEXT_OR_PHOTO_CHOICE"
+        keyboard = ReplyKeyboardMarkup(
+            [["📸 Решить по фото", "✍️ Напишу текстом"]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+        await update.message.reply_text(
+            "Не получилось обработать фото. Попробуй ещё раз (лучше освещение/резкость) или пришли задание текстом.",
+            reply_markup=keyboard
+        )
     finally:
         await spinner_finish()
 
@@ -976,7 +998,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Бесплатное уточнение
     if state == "AWAIT_FOLLOWUP_FREE":
-        USER_STATE[uid] = "AWAIT_FOLLOWUP_NEXT"  # далее платные
+        USER_STATE[uid] = "AWAIT_FOLLOWUP_NEXT"
         ctx = get_followup_context(uid)
         if not ctx or not in_free_window(ctx) or ctx.get("used_free", False):
             USER_STATE[uid] = "AWAIT_FOLLOWUP_PAID"
@@ -1027,7 +1049,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.args = [raw]
         return await essay_cmd(update, context)
 
-    # Обычный текст — решаем как Free/Pro в зависимости от статуса и флага
     need_pro = PRO_NEXT[uid]
     ok, mode, reason = consume_request(uid, need_pro=need_pro)
     if not ok:
@@ -1230,26 +1251,24 @@ async def vdbtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 rules = await asyncio.wait_for(_srch(subj_raw), timeout=3.0)
             except Exception as e:
                 log.warning(f"/vdbtest fallback timeout/fail: {e}")
-        if not rules:
-            return await update.message.reply_text("⚠️ Ничего не нашёл в ВБД по этому запросу.")
-        lines = []
+        items = []
         for r in (rules or [])[:5]:
-            book = (r.get("book") or "").strip(); ch = (r.get("chapter") or "").strip(); pg = r.get("page")
-            brief = (r.get("rule_brief") or r.get("text") or r.get("rule") or "").strip()
-            meta = " · ".join([x for x in [book, ch, f"стр. {pg}" if pg else ""] if x])
-            lines.append(("— " + brief) + (f"\n   ({meta})" if meta else ""))
-        out = "\n".join(lines)[:3500]
-        return await update.message.reply_text(out or "⚠️ Пусто.")
+            brief = (r.get("rule_brief") or r.get("text") or r.get("rule") or "") if isinstance(r, dict) else str(r)
+            brief = clamp_words(brief, 120)
+            items.append("• " + brief)
+        await update.message.reply_text("\n".join(items) or "Ничего не нашлось.")
     except Exception as e:
-        log.exception("vdbtest")
-        return await update.message.reply_text(f"Ошибка ВБД: {e}")
+        log.exception("/vdbtest")
+        await update.message.reply_text(f"Ошибка: {e}")
 
 # ========= HEALTH / WEBHOOKS =========
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     try:
         log.exception("Unhandled error in handler", exc_info=context.error)
         if isinstance(update, Update) and update.effective_message:
-            await update.effective_message.reply_text("⚠️ Упс, что-то пошло не так. Попробуй ещё раз.")
+            await update.effective_message.reply_text(
+                "⚠️ Упс, что-то пошло не так. Попробуй ещё раз."
+            )
     except Exception:
         pass
 
@@ -1288,8 +1307,10 @@ class _Health(BaseHTTPRequestHandler):
                 return self._ok(b"ok")
             if self.path == "/stats.json":
                 payload = stats_snapshot()
-                return self._ok(json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                                "application/json; charset=utf-8")
+                return self._ok(
+                    json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                    "application/json; charset=utf-8",
+                )
             return self._err(404, "not found")
         except Exception as e:
             log.exception("http-get")
@@ -1303,21 +1324,17 @@ class _Health(BaseHTTPRequestHandler):
             auth = self.headers.get("X-Auth", "")
             path = self.path
 
-            # /vdb/search
             if path == "/vdb/search":
                 if VDB_WEBHOOK_SECRET and auth != VDB_WEBHOOK_SECRET:
                     return self._err(401, {"ok": False, "error": "bad auth"})
-
                 q = str(data.get("q") or "").strip()
                 if not q:
                     return self._err(400, {"ok": False, "error": "empty q"})
-
                 try:
                     top_k = int(data.get("top_k", 5))
                 except Exception:
                     top_k = 5
                 top_k = max(1, min(20, top_k))
-
                 subject_in = str(data.get("subject") or "").strip().lower()
                 grade_in = data.get("grade", None)
                 subj_key = subject_to_vdb_key(subject_in) if subject_in else "auto"
@@ -1325,34 +1342,44 @@ class _Health(BaseHTTPRequestHandler):
                     grade_int = int(grade_in) if grade_in is not None else 8
                 except Exception:
                     grade_int = 8
-
                 q_clamped = clamp_words(q, 40)
-
                 loop = getattr(self.server, "loop", None)  # type: ignore
                 if loop is None:
                     return self._err(500, {"ok": False, "error": "loop missing"})
 
                 async def _run():
                     try:
-                        rules = await search_rules(client, q_clamped, subj_key, grade_int, top_k=top_k)
+                        rules = await search_rules(
+                            client, q_clamped, subj_key, grade_int, top_k=top_k
+                        )
                         if not rules and subj_key != "auto":
-                            rules = await search_rules(client, q_clamped, subject_in or "auto", grade_int, top_k=top_k)
+                            rules = await search_rules(
+                                client,
+                                q_clamped,
+                                subject_in or "auto",
+                                grade_int,
+                                top_k=top_k,
+                            )
                     except Exception as e:
                         log.exception("vdb search fail")
                         return {"ok": False, "error": f"{e}"}
                     items = []
                     for r in (rules or [])[:top_k]:
-                        brief = (r.get("rule_brief") or r.get("text") or r.get("rule") or "").strip()
-                        items.append({
-                            "brief": clamp_words(brief, 120),
-                            "meta": {
-                                "book": (r.get("book") or "").strip(),
-                                "chapter": (r.get("chapter") or "").strip(),
-                                "page": r.get("page"),
-                                "subject": subject_in or subj_key,
-                                "grade": grade_int,
-                            },
-                        })
+                        brief = (
+                            r.get("rule_brief") or r.get("text") or r.get("rule") or ""
+                        ).strip() if isinstance(r, dict) else str(r).strip()
+                        items.append(
+                            {
+                                "brief": clamp_words(brief, 120),
+                                "meta": {
+                                    "book": (r.get("book") or "").strip() if isinstance(r, dict) else "",
+                                    "chapter": (r.get("chapter") or "").strip() if isinstance(r, dict) else "",
+                                    "page": (r.get("page") if isinstance(r, dict) else None),
+                                    "subject": subject_in or subj_key,
+                                    "grade": grade_int,
+                                },
+                            }
+                        )
                     return {"ok": True, "count": len(items), "items": items}
 
                 fut = asyncio.run_coroutine_threadsafe(_run(), loop)
@@ -1362,12 +1389,11 @@ class _Health(BaseHTTPRequestHandler):
                     return self._err(504, {"ok": False, "error": f"timeout: {e}"})
                 return self._json(200, res)
 
-            # /webhook/bepaid — заглушка
             if path == "/webhook/bepaid":
                 if BEPAID_WEBHOOK_SECRET and auth != BEPAID_WEBHOOK_SECRET:
                     return self._err(401, {"ok": False, "error": "bad auth"})
                 log.info("bePaid webhook: %s", data)
-                # TODO: здесь отметить оплату (credits/sub). Пока просто 200 OK:
+                # TODO: отметить оплату (credits/sub). Пока просто 200 OK:
                 return self._json(200, {"ok": True})
 
             return self._err(404, "not found")
@@ -1381,7 +1407,6 @@ class _HealthThread(threading.Thread):
         super().__init__(name="health-thread")
         self.port = port
         self.loop = None
-
     def run(self):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
@@ -1392,13 +1417,15 @@ class _HealthThread(threading.Thread):
 
 def _start_health_and_metrics():
     port = int(os.getenv("HEALTH_PORT", os.getenv("PORT", "8080")))
-    ht = _HealthThread(port); ht.start()
-    threading.Thread(target=_stats_autosave_loop, name="stats-autosave", daemon=True).start()
+    ht = _HealthThread(port)
+    ht.start()
+    threading.Thread(
+        target=_stats_autosave_loop, name="stats-autosave", daemon=True
+    ).start()
     return ht
 
 # ---------- Регистрация хэндлеров ----------
 def _register_handlers(app: Application):
-    # Команды
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -1418,28 +1445,22 @@ def _register_handlers(app: Application):
     app.add_handler(CommandHandler("sudo_add", sudo_add_cmd))
     app.add_handler(CommandHandler("sudo_del", sudo_del_cmd))
 
-    # Callback-кнопки
     app.add_handler(CallbackQueryHandler(on_admin_callback, pattern=r"^admin:"))
     app.add_handler(CallbackQueryHandler(on_buy_stars_cb, pattern=r"^buy_stars"))
 
-    # Контент
     app.add_handler(MessageHandler(f.PHOTO | f.Document.IMAGE, handle_photo))
     app.add_handler(MessageHandler(f.TEXT & ~f.COMMAND, on_text))
 
-    # Ошибки
     app.add_error_handler(on_error)
 
 # ---------- post_init: строго в builder ----------
 async def _post_init(app: Application):
     try:
-        # 1) Гарантированно отключаем webhook перед polling (фикс 409 Conflict)
         try:
             await app.bot.delete_webhook(drop_pending_updates=True)
             log.info("Webhook deleted (drop_pending_updates=True)")
         except Exception as e:
             log.warning(f"delete_webhook failed: {e}")
-
-        # 2) Команды
         await set_commands(app)
         log.info("Bot commands set")
     except Exception as e:
@@ -1450,7 +1471,6 @@ def main():
     if not TELEGRAM_TOKEN:
         raise SystemExit("Нет TELEGRAM_TOKEN (fly secrets set TELEGRAM_TOKEN=...)")
 
-    # Метрики + health
     try:
         stats_load()
         _start_health_and_metrics()
@@ -1461,13 +1481,16 @@ def main():
         Application.builder()
         .token(TELEGRAM_TOKEN)
         .concurrent_updates(True)
-        .post_init(_post_init)   # правильное место для PTB
+        .post_init(_post_init)
         .build()
     )
 
     _register_handlers(app)
 
-    log.info("Bot is starting (long-polling). Health on %s", os.getenv("HEALTH_PORT", os.getenv("PORT", "8080")))
+    log.info(
+        "Bot is starting (long-polling). Health on %s",
+        os.getenv("HEALTH_PORT", os.getenv("PORT", "8080")),
+    )
     app.run_polling(
         close_loop=False,
         drop_pending_updates=True,
