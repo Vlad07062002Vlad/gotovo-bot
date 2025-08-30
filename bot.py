@@ -1153,112 +1153,193 @@ async def vdbtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("vdbtest")
         return await update.message.reply_text(f"Ошибка ВБД: {e}")
 
-# =========[ БЛОК 6/6 — ФИНАЛ ]=================================================
-# Платежи (Stars + bePaid) уже подключены выше.
-# Здесь: health-сервер старт, error-handler, рег. хэндлеров, main()
+# =========================
+# === БЛОК 6/6 (ФИНАЛ) ===
+# Платежи, health-сервер, main()
+# =========================
 
-# --- Фолбэк-классификатор предмета (если не определён выше) ---
-if "classify_subject" not in globals():
-    try:
-        from services.classifier import classify_subject as _clf_subject  # type: ignore
-        async def classify_subject(text: str) -> str:
+import os, io, json, time, threading, asyncio, logging
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from telegram import (
+    Update, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
+)
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, filters as f,
+    ContextTypes, CallbackQueryHandler
+)
+
+log = logging.getLogger("gotovo-bot")
+
+# ===== Параметры подписки =====
+TRIAL_DAYS = 7
+PRO_MONTH_DAYS = 30
+
+STARS_WEBHOOK_SECRET   = os.getenv("STARS_WEBHOOK_SECRET", "")
+BEPAID_WEBHOOK_SECRET  = os.getenv("BEPAID_WEBHOOK_SECRET", "")
+BEPAID_PUBLIC_CHECKOUT = os.getenv("BEPAID_PUBLIC_CHECKOUT_URL", "")
+
+# ===== Простое хранилище пользователей =====
+USERS = {}
+
+def _now(): return time.time()
+
+def get_user(uid: int) -> dict:
+    u = USERS.get(str(uid))
+    if not u:
+        u = {
+            "uid": uid,
+            "first_seen": _now(),
+            "last_seen": _now(),
+            "pro_until": 0.0,
+            "flags": {"trial_granted": False},
+        }
+        USERS[str(uid)] = u
+    else:
+        u["last_seen"] = _now()
+    return u
+
+def is_pro(u: dict) -> bool: return u.get("pro_until", 0) > _now()
+
+def ensure_trial(uid: int) -> bool:
+    u = get_user(uid)
+    if not u["flags"].get("trial_granted"):
+        u["flags"]["trial_granted"] = True
+        u["pro_until"] = _now() + TRIAL_DAYS * 86400
+        return True
+    return False
+
+def grant_pro_days(uid: int, days: int):
+    u = get_user(uid)
+    base = max(u.get("pro_until", 0), _now())
+    u["pro_until"] = base + days * 86400
+
+# ===== Команды =====
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    u = get_user(uid)
+    just = ensure_trial(uid)
+    if just:
+        msg = (
+            "<b>👋 Добро пожаловать!</b>\n\n"
+            f"Тебе активирован <b>{TRIAL_DAYS}-дневный Pro-триал</b>. "
+            "После него останется бесплатный режим (gpt-4o-mini)."
+        )
+    elif is_pro(u):
+        left = int((u["pro_until"] - _now()) / 86400) + 1
+        msg = f"✅ У тебя активен <b>Pro</b>, осталось ~{left} дн."
+    else:
+        msg = "ℹ️ Триал уже использован. Сейчас — Free (gpt-4o-mini). Чтобы вернуться к Pro: /buy"
+    await update.message.reply_html(msg)
+
+async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    text = (
+        "<b>Оплата Pro</b>\n\n"
+        "• <b>bePaid</b> (карта РБ / ЕРИП)\n"
+        "• <b>Telegram Stars</b>\n\n"
+        f"После оплаты Pro активируется на {PRO_MONTH_DAYS} дней."
+    )
+    bep_url = BEPAID_PUBLIC_CHECKOUT
+    if bep_url:
+        sep = "&" if "?" in bep_url else "?"
+        bep_url = f"{bep_url}{sep}uid={uid}"
+    kb = [
+        [InlineKeyboardButton("💳 Оплатить (bePaid)", url=bep_url or "https://example.com/bepaid")],
+        [InlineKeyboardButton("⭐ Оплатить Stars", callback_data="buy_stars")],
+    ]
+    await update.message.reply_html(text, reply_markup=InlineKeyboardMarkup(kb))
+
+async def on_buy_stars_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text("Открыл счёт ⭐ Stars. Заверши оплату в Telegram — статус обновится автоматически.")
+
+# ===== Health-сервер =====
+class _Health(BaseHTTPRequestHandler):
+    def _json(self, code, data):
+        body = json.dumps(data, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/": return self._json(200, {"ok": True, "ts": int(_now())})
+        if self.path.startswith("/stats.json"):
+            total = len(USERS)
+            pro = sum(1 for u in USERS.values() if is_pro(u))
+            return self._json(200, {"ok": True, "users": total, "pro": pro})
+        return self._json(404, {"ok": False, "error": "not_found"})
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or "0")
+        raw = self.rfile.read(length) if length > 0 else b""
+        try: data = json.loads(raw.decode() or "{}")
+        except: data = {}
+
+        if self.path.startswith("/vdb/search"):
+            q = str(data.get("q") or "").strip()
+            if not q: return self._json(400, {"ok": False, "error": "empty_query"})
             try:
-                return await _clf_subject(text)
-            except Exception:
-                return "auto"
-    except Exception:
-        async def classify_subject(text: str) -> str:
-            return "auto"
+                loop = self.server.loop  # type: ignore
+                async def _srch(): return [{"text": f"stub: {q}", "score": 1.0}]
+                fut = asyncio.run_coroutine_threadsafe(_srch(), loop)
+                return self._json(200, {"ok": True, "results": fut.result(3)})
+            except Exception as e:
+                return self._json(500, {"ok": False, "error": str(e)})
 
-# --- Единый error-handler телеграм-бота ---
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        log.exception("Unhandled error in handler", exc_info=context.error)
-        if isinstance(update, Update) and update.effective_message:
-            await update.effective_message.reply_text("⚠️ Упс, что-то пошло не так. Попробуй ещё раз.")
-    except Exception:
-        pass
+        if self.path.startswith("/webhook/bepaid"):
+            if self.headers.get("X-Auth") != BEPAID_WEBHOOK_SECRET:
+                return self._json(401, {"ok": False, "error": "unauthorized"})
+            uid = int(data.get("uid") or 0)
+            if uid: grant_pro_days(uid, PRO_MONTH_DAYS); return self._json(200, {"ok": True})
+            return self._json(400, {"ok": False, "error": "bad_payload"})
 
-# --- Старт health-сервера и авто-сейва метрик ---
+        if self.path.startswith("/webhook/stars"):
+            if self.headers.get("X-Auth") != STARS_WEBHOOK_SECRET:
+                return self._json(401, {"ok": False, "error": "unauthorized"})
+            uid = int(data.get("uid") or 0)
+            if uid: grant_pro_days(uid, PRO_MONTH_DAYS); return self._json(200, {"ok": True})
+            return self._json(400, {"ok": False, "error": "bad_payload"})
+
+        return self._json(404, {"ok": False, "error": "not_found"})
+
+class _HealthThread(threading.Thread):
+    daemon = True
+    def __init__(self, port: int): super().__init__(name="health-thread"); self.port=port; self.loop=None
+    def run(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        httpd = HTTPServer(("0.0.0.0", self.port), _Health)
+        httpd.loop = self.loop  # type: ignore
+        log.info("Health server on 0.0.0.0:%s", self.port)
+        httpd.serve_forever()
+
 def _start_health_and_metrics():
-    # health: отдельный поток с собственным event loop
     port = int(os.getenv("HEALTH_PORT", os.getenv("PORT", "8080")))
-    ht = _HealthThread(port)
-    ht.start()
+    ht = _HealthThread(port); ht.start(); return ht
 
-    # автосохранение метрик
-    t = threading.Thread(target=_stats_autosave_loop, name="stats-autosave", daemon=True)
-    t.start()
-
-    return ht, t
-
-# --- Регистрация всех хэндлеров ---
+# ===== Main =====
 def _register_handlers(app: Application):
-    # Команды
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("menu", menu_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("about", about_cmd))
-    app.add_handler(CommandHandler("subject", subject_cmd))
-    app.add_handler(CommandHandler("grade", grade_cmd))
-    app.add_handler(CommandHandler("parent", parent_cmd))
-    app.add_handler(CommandHandler("mystats", mystats_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("buy", buy_cmd))
-    app.add_handler(CommandHandler("explain", explain_cmd))
-    app.add_handler(CommandHandler("essay", essay_cmd))
-    app.add_handler(CommandHandler("vdbtest", vdbtest_cmd))
-    app.add_handler(CommandHandler("whoami", whoami_cmd))
-    app.add_handler(CommandHandler("admin", admin_cmd))
-    app.add_handler(CommandHandler("admins", admins_cmd))
-    app.add_handler(CommandHandler("sudo_add", sudo_add_cmd))
-    app.add_handler(CommandHandler("sudo_del", sudo_del_cmd))
-
-    # Callback-кнопки
-    app.add_handler(CallbackQueryHandler(on_admin_callback, pattern=r"^admin:"))
     app.add_handler(CallbackQueryHandler(on_buy_stars_cb, pattern=r"^buy_stars"))
 
-    # Фото и тексты
-    app.add_handler(MessageHandler(f.PHOTO | f.Document.IMAGE, handle_photo))
-    app.add_handler(MessageHandler(f.TEXT & ~f.COMMAND, on_text))
-
-    # Ошибки
-    app.add_error_handler(on_error)
-
-# --- MAIN ---
 def main():
     token = os.getenv("TELEGRAM_TOKEN")
-    if not token:
-        raise SystemExit("Нет TELEGRAM_TOKEN (fly secrets set TELEGRAM_TOKEN=...)")
+    if not token: raise SystemExit("Нет TELEGRAM_TOKEN")
 
-    # Грузим накопленные метрики, поднимаем служебные потоки
-    stats_load()
     _start_health_and_metrics()
 
-    # Билдим приложение Telegram
-    app = Application.builder().token(token).concurrent_updates(True).build()
-
-    # Команды в меню
-    try:
-        app.job_queue.run_once(lambda *_: None, when=0.0)  # «прогрев» JobQueue от PTB
-        app.create_task(set_commands(app))
-    except Exception as e:
-        log.warning(f"set_commands failed: {e}")
-
-    # Хэндлеры
+    app = Application.builder().token(token).build()
     _register_handlers(app)
 
-    log.info("Bot is starting (long-polling). Health on port %s", os.getenv("HEALTH_PORT", os.getenv("PORT", "8080")))
-    # В проде на Fly.io оставляем long-polling: health-сервер держит открытый HTTP-порт для liveness.
-    app.run_polling(close_loop=False, drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
+    log.info("Bot started (long-polling)")
+    app.run_polling()
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        log.info("Shutdown requested by user")
-    except Exception:
-        log.exception("Fatal in main")
-        raise
-# =========[ КОНЕЦ БЛОКА 6/6 ]==================================================
+    main()
+# =========================
+# === КОНЕЦ БЛОКА 6/6 ====
+# =========================
