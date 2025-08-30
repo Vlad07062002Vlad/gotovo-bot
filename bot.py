@@ -1366,8 +1366,14 @@ def main():
     except Exception as e:
         log.warning(f"stats/health start warn: {e}")
 
-    # Telegram App
-    app = Application.builder().token(TELEGRAM_TOKEN).concurrent_updates(True).build()
+    # Telegram App — ВАЖНО: post_init ставим на builder, НЕ в run_polling
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .concurrent_updates(True)
+        .post_init(_post_init)   # <<< вот так правильно для твоей версии PTB
+        .build()
+    )
 
     # Хэндлеры
     _register_handlers(app)
@@ -1377,7 +1383,7 @@ def main():
         close_loop=False,
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
-        post_init=_post_init,   # команды ставим корректно, когда уже есть event loop
+        # !! Никакого post_init здесь быть не должно, иначе TypeError в твоей версии PTB
     )
 
 if __name__ == "__main__":
@@ -1388,4 +1394,3 @@ if __name__ == "__main__":
     except Exception:
         log.exception("Fatal in main")
         raise
-# =========[ КОНЕЦ БЛОКА 6/6 ]==================================================
