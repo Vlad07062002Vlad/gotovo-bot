@@ -1,6 +1,8 @@
-# bot.py — R1+VDB: монетизация + статистика + гибридные модели (4o-mini / o4-mini / 4o) + ВБД (Qdrant RAG) + АДМИНКА
+# bot.py — R1+VDB: монетизация + статистика + гибридные модели (4o-mini / o4-mini / 4o)
 # Регион: Беларусь. Оплаты: Telegram Stars / Карта РБ / ЕРИП.
-# + Follow-up: 1 бесплатное уточнение с контекстом (15 минут), затем — списание.
+# Follow-up: 1 бесплатное уточнение (15 минут), затем — списание.
+# Фиксы: безопасные импорты RAG/формул/сервисов, таймауты LLM/RAG, mystats, правка /webhook/erip,
+# убраны дубли _Health, добавлены admins/sudo*, исправлен MedianFilter, логирование.
 
 import os
 import io
@@ -312,7 +314,7 @@ async def classify_subject(text: str) -> str:
 def _preprocess_image(img: Image.Image) -> Image.Image:
     img = ImageOps.exif_transpose(img).convert("L")
     img = ImageOps.autocontrast(img)
-    img = ImageFilter.MedianFilter(size=3)(img)
+    img = img.filter(ImageFilter.MedianFilter(size=3))  # FIX: правильно применяем фильтр
     img = ImageEnhance.Sharpness(img).enhance(1.2)
     max_w = 1800
     if img.width < max_w:
@@ -416,6 +418,15 @@ async def call_model(uid: int, user_text: str, mode: str) -> str:
                     "Попробуй ещё раз через минуту. Тех. детали в логах.")
     dt = perf_counter() - t0
     log.info(f"LLM model={model} tag={tag} mode={mode} dt={dt:.2f}s")
+
+    # метрики
+    try:
+        st = _get_user_stats(uid)
+        st.gpt_calls += 1
+        st.gpt_time_sum += float(dt)
+    except Exception:
+        pass
+
     return out_text
 
 async def call_model_followup(uid: int, prev_task: str, prev_answer: str, follow_q: str, mode_tag: str) -> str:
@@ -442,6 +453,10 @@ async def call_model_followup(uid: int, prev_task: str, prev_answer: str, follow
         out = "❌ Не удалось получить уточнение от модели. Попробуй ещё раз."
     dt = perf_counter() - t0
     log.info(f"LLM followup model={model} tag={tag} mode={mode_tag} dt={dt:.2f}s")
+    try:
+        st = _get_user_stats(uid); st.gpt_calls += 1; st.gpt_time_sum += float(dt)
+    except Exception:
+        pass
     return out
 
 # ---------- Формулы ----------
@@ -666,7 +681,7 @@ def _stars_amount(payload: str) -> int:
     }
     return defaults.get(payload, 100)
 
-# ---------- Команды ----------
+# ---------- Команды / меню ----------
 async def set_commands(app: Application):
     await app.bot.set_my_commands(
         [
@@ -792,6 +807,8 @@ async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if subj in SUBJECTS:
             USER_SUBJECT[uid] = subj
 
+    _get_user_stats(uid).kinds["solve_text"] += 1
+
     spinner_finish, spinner_set = await start_spinner(update, context, "Решаю задачу…")
     try:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
@@ -826,6 +843,8 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             erip_url=ERIP_CHECKOUT_URL or None,
         )
         return await update.message.reply_text(f"Лимит исчерпан ({reason}). Оформи Pro или купи кредиты:", reply_markup=kb_i)
+
+    _get_user_stats(uid).kinds["essay"] += 1
 
     spinner_finish, spinner_set = await start_spinner(update, context, "Готовлю сочинение…")
     try:
@@ -868,17 +887,23 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             raise ValueError("No image")
         data = await tg_file.download_as_bytearray()
+        _get_user_stats(uid).bytes_images_in += len(data)
         img = Image.open(io.BytesIO(data))
 
         spinner_set("Распознаю текст…")
         ocr_text = ocr_image(img)
-        if not ocr_text.strip():
+        if ocr_text.strip():
+            _get_user_stats(uid).ocr_ok += 1
+        else:
+            _get_user_stats(uid).ocr_fail += 1
             return await update.message.reply_text("Не удалось распознать текст. Попробуй переснять или напиши текстом.", reply_markup=kb(uid))
 
         if USER_SUBJECT[uid] == "auto":
             subj = await classify_subject(ocr_text)
             if subj in SUBJECTS:
                 USER_SUBJECT[uid] = subj
+
+        _get_user_stats(uid).kinds["solve_photo"] += 1
 
         spinner_set("Решаю…")
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
@@ -915,6 +940,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await free_vs_pro(update, context)
     if txt == "💳 купить" or txt == "/buy":
         return await buy_cmd(update, context)
+    if txt in {"🧾 моя статистика","моя статистика"}:
+        return await mystats_cmd(update, context)
     if txt == "⭐ pro (след. запрос)":
         plan = get_user_plan(uid)
         if plan["trial_left_today"] <= 0 and not plan["sub_active"] and plan["credits"] <= 0:
@@ -1042,16 +1069,6 @@ async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ---------- Админка ----------
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return await update.message.reply_text("Недостаточно прав.")
-    s = daily_summary()
-    await update.message.reply_text(
-        f"День {s['day']}: DAU={s['dau']}\n"
-        f"Бесплатные (free+trial)={s['free_total']}, платные={s['paid']} "
-        f"(credit={s['credit']}, sub={s['sub']})"
-    )
-
 def admin_kb(page_users: int = 1) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📈 Метрики", callback_data="admin:metrics")],
@@ -1145,6 +1162,108 @@ async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Показывать: выручка, кол-во покупок, конверсия, последние N операций.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Меню", callback_data="admin:menu")]]),
         ); return
+
+# ---------- Админ-команды: список/добавить/удалить ----------
+async def admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return await update.message.reply_text("Недостаточно прав.")
+    env_ids = sorted(_env_admin_ids())
+    db_ids = sorted(_load_admins_from_db())
+    union_ids = sorted(all_admin_ids())
+    lines = [
+        "<b>Админы (ENV):</b> " + (", ".join(map(str, env_ids)) or "—"),
+        "<b>Админы (DB):</b> " + (", ".join(map(str, db_ids)) or "—"),
+        "<b>Итого:</b> " + (", ".join(map(str, union_ids)) or "—"),
+        "",
+        "Добавить: <code>/sudo_add 123456789</code>",
+        "Удалить: <code>/sudo_del 123456789</code>",
+    ]
+    await update.message.reply_html("\n".join(lines))
+
+async def sudo_add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return await update.message.reply_text("Недостаточно прав.")
+    if not context.args or not context.args[0].isdigit():
+        return await update.message.reply_text("Используй: /sudo_add <telegram_id>")
+    target = int(context.args[0])
+    add_admin(target)
+    log.info(f"ADMIN: {uid} added admin {target}")
+    await update.message.reply_text(f"Готово. Добавлен admin: {target}")
+
+async def sudo_del_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return await update.message.reply_text("Недостаточно прав.")
+    if not context.args or not context.args[0].isdigit():
+        return await update.message.reply_text("Используй: /sudo_del <telegram_id>")
+    target = int(context.args[0])
+    del_admin(target)
+    log.info(f"ADMIN: {uid} removed admin {target}")
+    await update.message.reply_text(f"Готово. Удалён admin: {target}")
+
+# ---------- ВБД: тестовый поиск (админ) ----------
+async def vdbtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    try:
+        if not is_admin(uid):
+            return await update.message.reply_text("Недостаточно прав.")
+    except Exception:
+        return await update.message.reply_text("Недостаточно прав.")
+
+    q = " ".join(context.args).strip() if context.args else ""
+    if not q:
+        return await update.message.reply_text(
+            "Использование: /vdbtest запрос...\n"
+            "Пример: /vdbtest формула площади трапеции\n"
+            "Пример: /vdbtest раствор цемента м200 пропорции 5"
+        )
+
+    subj_raw = USER_SUBJECT.get(uid, "auto")
+    subj_key = subject_to_vdb_key(subj_raw)
+    try:
+        grade_int = int(USER_GRADE.get(uid, "8")) if str(USER_GRADE.get(uid, "8")).isdigit() else 8
+    except Exception:
+        grade_int = 8
+
+    q_clamped = clamp_words(q, 40)
+
+    async def _srch(skey):
+        return await search_rules(client, q_clamped, skey, grade_int, top_k=5)
+
+    try:
+        rules = []
+        try:
+            rules = await asyncio.wait_for(_srch(subj_key), timeout=3.0)
+        except Exception as e:
+            rules = []
+            log.warning(f"/vdbtest primary timeout/fail: {e}")
+
+        if not rules and subj_key != subj_raw:
+            try:
+                rules = await asyncio.wait_for(_srch(subj_raw), timeout=3.0)
+            except Exception as e:
+                log.warning(f"/vdbtest fallback timeout/fail: {e}")
+                rules = []
+
+        if not rules:
+            return await update.message.reply_text("⚠️ Ничего не нашёл в ВБД по этому запросу.")
+
+        lines = []
+        for r in rules[:5]:
+            book = (r.get("book") or "").strip()
+            ch = (r.get("chapter") or "").strip()
+            pg = r.get("page")
+            brief = (r.get("rule_brief") or r.get("text") or r.get("rule") or "").strip()
+            meta = " · ".join([x for x in [book, ch, f"стр. {pg}" if pg else ""] if x])
+            lines.append(("— " + brief) + (f"\n   ({meta})" if meta else ""))
+
+        out = "\n".join(lines)[:3500]
+        return await update.message.reply_text(out or "⚠️ Пусто.")
+    except Exception as e:
+        log.exception("vdbtest")
+        return await update.message.reply_text(f"Ошибка ВБД: {e}")
 
 # ---------- Платёжные callbacks ----------
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1271,7 +1390,7 @@ class _Health(BaseHTTPRequestHandler):
                 if auth != ERIP_WEBHOOK_SECRET or not ERIP_WEBHOOK_SECRET:
                     return self._err(401, "bad auth")
                 uid = int(data.get("user_id", 0) or 0)
-                kind = data.get("kind")  # фикс: строка должна быть целой  (см. твой отчёт)  :contentReference[oaicite:1]{index=1}
+                kind = data.get("kind")  # важная строка — целая
                 if not uid or not kind:
                     return self._err(400, "bad payload")
                 msg = apply_payment_payload(uid, kind)
@@ -1279,20 +1398,33 @@ class _Health(BaseHTTPRequestHandler):
 
             return self._err(404, "not found")
         except Exception as e:
+            log.exception("http-post")
             return self._err(500, f"error: {e}")
 
 def _run_health():
     HTTPServer(("0.0.0.0", PORT), _Health).serve_forever()
 
 # ---------- MAIN ----------
-def main():
-    try: stats_load()
-    except Exception as e: log.warning(f"stats_load failed: {e}")
+class _HealthThread(threading.Thread):
+    def run(self):
+        _run_health()
 
-    threading.Thread(target=_run_health, daemon=True).start()
+async def set_commands_post_init(app: Application):
+    try:
+        await set_commands(app)
+    except Exception as e:
+        log.warning(f"set_commands failed: {e}")
+
+def main():
+    try:
+        stats_load()
+    except Exception as e:
+        log.warning(f"stats_load failed: {e}")
+
+    _HealthThread(daemon=True).start()
     threading.Thread(target=_stats_autosave_loop, daemon=True).start()
 
-    app = Application.builder().token(TELEGRAM_TOKEN).post_init(set_commands).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(set_commands_post_init).build()
 
     # Команды
     app.add_handler(CommandHandler("start", start_cmd))
@@ -1311,8 +1443,10 @@ def main():
     app.add_handler(CommandHandler("whoami", whoami_cmd))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("admins", admins_cmd))
+    app.add_handler(CommandHandler("sudo_add", sudo_add_cmd))
+    app.add_handler(CommandHandler("sudo_del", sudo_del_cmd))
 
-    # Админ callback'и/платежи
+    # Колбэки: сначала админские, затем платёжные
     app.add_handler(CallbackQueryHandler(on_admin_callback, pattern=r"^admin:"))
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^buy_stars:"))
     app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
@@ -1327,6 +1461,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-    
-
