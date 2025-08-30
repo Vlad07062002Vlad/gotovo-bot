@@ -1154,9 +1154,9 @@ async def vdbtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text(f"Ошибка ВБД: {e}")
 
 # =========[ БЛОК 6/6 — ФИНАЛ ]=================================================
-# Платежи: Stars + bePaid (единая витрина: карта РБ/ЕРИП).
-# Health-сервер: GET /, GET /stats.json, POST /vdb/search (+ webhook bePaid).
-# ВАЖНО: это единственная версия on_error/_Health/_HealthThread/_start_health_and_metrics/_register_handlers/main.
+# Платежи: Stars + bePaid (карта РБ/ЕРИП внутри bePaid).
+# Health-сервер: GET /, GET /stats.json, POST /vdb/search, POST /webhook/bepaid.
+# ЕДИНСТВЕННЫЕ версии on_error/_Health/_HealthThread/_start_health_and_metrics/_register_handlers/main.
 
 # --- Единый error-handler телеграм-бота ---
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -1166,6 +1166,15 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text("⚠️ Упс, что-то пошло не так. Попробуй ещё раз.")
     except Exception:
         pass
+
+# --- Колбэк для Telegram Stars (кнопка в /buy) ---
+async def on_buy_stars_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "⭐ Заказ через Telegram Stars открыт. Заверши оплату в Telegram.\n"
+        "После подтверждения статус обновится автоматически."
+    )
 
 # --- Health + webhooks (bePaid) + VDB search ---
 class _Health(BaseHTTPRequestHandler):
@@ -1273,7 +1282,7 @@ class _Health(BaseHTTPRequestHandler):
             if path == "/webhook/bepaid":
                 if BEPAID_WEBHOOK_SECRET and auth != BEPAID_WEBHOOK_SECRET:
                     return self._err(401, {"ok": False, "error": "bad auth"})
-                # TODO: отметить оплату (подписка/кредиты) — сейчас просто лог.
+                # TODO: отметить оплату (активация подписки/кредитов) — в MVP просто логируем:
                 log.info("bePaid webhook: %s", data)
                 return self._json(200, {"ok": True})
 
@@ -1305,7 +1314,7 @@ def _start_health_and_metrics():
     threading.Thread(target=_stats_autosave_loop, name="stats-autosave", daemon=True).start()
     return ht
 
-# --- Регистрация всех хэндлеров (единственная версия) ---
+# --- Регистрация всех хэндлеров (ЕДИНСТВЕННАЯ версия) ---
 def _register_handlers(app: Application):
     # Команды
     app.add_handler(CommandHandler("start", start_cmd))
@@ -1338,7 +1347,14 @@ def _register_handlers(app: Application):
     # Ошибки
     app.add_error_handler(on_error)
 
-# --- MAIN (единственная версия) ---
+# --- Пост-инициализация: корректная установка /commands после старта лупа ---
+async def _post_init(app: Application):
+    try:
+        await set_commands(app)
+    except Exception as e:
+        log.warning(f"set_commands failed: {e}")
+
+# --- MAIN (ЕДИНСТВЕННАЯ версия) ---
 def main():
     if not TELEGRAM_TOKEN:
         raise SystemExit("Нет TELEGRAM_TOKEN (fly secrets set TELEGRAM_TOKEN=...)")
@@ -1353,18 +1369,16 @@ def main():
     # Telegram App
     app = Application.builder().token(TELEGRAM_TOKEN).concurrent_updates(True).build()
 
-    # Команды (асинхронно, чтобы не блокировать запуск)
-    try:
-        app.create_task(set_commands(app))
-    except Exception as e:
-        log.warning(f"set_commands failed: {e}")
-
     # Хэндлеры
     _register_handlers(app)
 
     log.info("Bot is starting (long-polling). Health on %s", os.getenv("HEALTH_PORT", os.getenv("PORT", "8080")))
-    app.run_polling(close_loop=False, drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
+    app.run_polling(
+        close_loop=False,
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+        post_init=_post_init,   # команды ставим корректно, когда уже есть event loop
+    )
 
 if __name__ == "__main__":
     try:
